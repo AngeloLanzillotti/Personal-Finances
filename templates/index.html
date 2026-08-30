@@ -5,17 +5,15 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Dashboard Finanze</title>
-    <!-- Script Esterni -->
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <!-- File JS Separato -->
     <script src="/static/dashboard.js" defer></script>
 </head>
 
 <body class="bg-slate-900 text-white font-sans p-4 pb-12">
     <div class="max-w-md mx-auto space-y-4">
-        <!-- Header con Bottone Refresh -->
+        <!-- Header -->
         <div class="flex justify-between items-center border-b border-slate-700 pb-3">
             <div>
                 <h1 class="text-xl font-bold">📊 Bilancio Personale</h1>
@@ -57,6 +55,12 @@
             <div id="friendsBalances" class="space-y-2 text-xs">
                 <p class="text-slate-500">Caricamento saldi...</p>
             </div>
+        </div>
+
+        <!-- BOX DI DIAGNOSTICA DEBUG -->
+        <div class="bg-slate-950 p-3 rounded-xl border border-dashed border-slate-700 text-[11px] font-mono text-slate-400 space-y-1">
+            <div class="text-amber-400 font-bold">🛠️ Log Diagnostica WebApp:</div>
+            <div id="debugLog">In attesa di caricamento...</div>
         </div>
     </div>
 </body>

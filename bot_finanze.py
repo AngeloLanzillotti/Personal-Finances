@@ -742,6 +742,9 @@ async def api_data(request):
     raw_user_id = request.query.get("user_id", "0")
     init_data = request.query.get("init_data", "")
 
+    logging.info(f"--- [DEBUG DASHBOARD] Inizio Richiesta ---")
+    logging.info(f"Parametri ricevuti -> user_id param: '{raw_user_id}', init_data len: {len(init_data)}")
+
     user_id = 0
     try:
         if raw_user_id and raw_user_id != "0":
@@ -755,17 +758,27 @@ async def api_data(request):
             if "user" in parsed:
                 user_dict = json.loads(parsed["user"][0])
                 user_id = int(user_dict.get("id", 0))
+                logging.info(f"User ID estratto da initData Telegram: {user_id}")
         except Exception as e:
-            logging.warning(f"Errore parsing init_data: {e}")
+            logging.error(f"Errore estrazione initData: {e}")
 
-    logging.info(f"📊 Richiesta API Dashboard per user_id: {user_id}")
+    logging.info(f"User ID finale utilizzato per la query: {user_id}")
 
-    mese_corrente = datetime.now().strftime("%Y-%m") # es: "2026-08"
+    mese_corrente = datetime.now().strftime("%Y-%m")
+    logging.info(f"Mese corrente cercato: {mese_corrente}")
 
-    conn = get_db_connection()
+    conn = None
     try:
+        conn = get_db_connection()
+        logging.info("Connessione a Supabase ottenuta dal pool con successo.")
+        
         with conn.cursor() as cursor:
-            # 1. ENTRATE (Conversione sicura ::text compatibile con Timestamp e Stringhe)
+            # DEBUG: Quante transazioni totali esistono per questo user_id nel DB?
+            cursor.execute("SELECT count(*), max(data_ora::text), max(data_creazione::text) FROM transazioni WHERE user_id = %s", (user_id,))
+            tot_rows, max_data_ora, max_data_creaz = cursor.fetchone()
+            logging.info(f"DB Check -> Transazioni totali trovate per user_id {user_id}: {tot_rows} | Max data_ora: {max_data_ora} | Max data_creazione: {max_data_creaz}")
+
+            # 1. ENTRATE
             cursor.execute("""
                 SELECT COALESCE(SUM(totale), 0.0) 
                 FROM transazioni 
@@ -807,10 +820,27 @@ async def api_data(request):
                 GROUP BY persona
             """, (user_id,))
             friends = [{"name": r[0], "balance": float(r[1] or 0.0)} for r in cursor.fetchall()]
+
+            logging.info(f"Risultato calcoli -> Entrate: €{inc}, Uscite: €{exp}, Categorie: {len(cats)}, Amici: {len(friends)}")
+
+    except Exception as e:
+        logging.error(f"❌ ERRORE SQL / DB durante api_data: {e}", exc_info=True)
+        return web.json_response({
+            "error": str(e),
+            "user_id_used": user_id,
+            "month": datetime.now().strftime("%m/%Y"),
+            "income": 0.0,
+            "expense": 0.0,
+            "balance": 0.0,
+            "categories": [],
+            "friends": []
+        }, status=500)
     finally:
-        release_db_connection(conn)
+        if conn:
+            release_db_connection(conn)
 
     return web.json_response({
+        "debug_user_id": user_id,
         "month": datetime.now().strftime("%m/%Y"),
         "income": inc,
         "expense": exp,
@@ -818,7 +848,7 @@ async def api_data(request):
         "categories": cats,
         "friends": friends
     })
-
+    
 # --- TASK ANTI-SLEEP IN BACKGROUND (SELF-PING OGNI 10 MINUTI) ---
 async def self_ping_task():
     await asyncio.sleep(30) # Attende che il server sia completamente avviato
