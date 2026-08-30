@@ -1,108 +1,151 @@
 <!DOCTYPE html>
 <html lang="it">
+
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Dashboard Finanze</title>
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard Finanze</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
+
 <body class="bg-slate-900 text-white font-sans p-4 pb-12">
-  <div class="max-w-md mx-auto space-y-4">
-    <!-- Header -->
-    <div class="flex justify-between items-center border-b border-slate-700 pb-3">
-      <h1 class="text-xl font-bold">📊 Bilancio Personale</h1>
-      <span id="currentMonth" class="text-xs bg-indigo-600 px-2.5 py-1 rounded-full"></span>
-    </div>
-
-    <!-- KPI Cards -->
-    <div class="grid grid-cols-3 gap-2">
-      <div class="bg-slate-800 p-3 rounded-xl border border-slate-700 text-center">
-        <p class="text-xs text-slate-400">Entrate</p>
-        <p id="totalIncome" class="text-sm font-bold text-emerald-400">+€0.00</p>
-      </div>
-      <div class="bg-slate-800 p-3 rounded-xl border border-slate-700 text-center">
-        <p class="text-xs text-slate-400">Uscite</p>
-        <p id="totalExpense" class="text-sm font-bold text-rose-400">-€0.00</p>
-      </div>
-      <div class="bg-slate-800 p-3 rounded-xl border border-slate-700 text-center">
-        <p class="text-xs text-slate-400">Saldo</p>
-        <p id="netBalance" class="text-sm font-bold text-indigo-400">€0.00</p>
-      </div>
-    </div>
-
-    <!-- Chart Card -->
-    <div class="bg-slate-800 p-4 rounded-2xl border border-slate-700 space-y-2">
-      <h2 class="text-sm font-semibold text-slate-300">Spese per Categoria</h2>
-      <div class="relative h-64 w-full">
-        <canvas id="expenseChart"></canvas>
-      </div>
-    </div>
-
-    <!-- Debiti / Crediti Amici Card -->
-    <div class="bg-slate-800 p-4 rounded-2xl border border-slate-700 space-y-3">
-      <h2 class="text-sm font-semibold text-slate-300">👥 Saldi Amici (Chi deve a chi)</h2>
-      <div id="friendsBalances" class="space-y-2 text-xs">
-        <p class="text-slate-500">Nessun debito o credito registrato.</p>
-      </div>
-    </div>
-  </div>
-
-  <script>
-    const tg = window.Telegram.WebApp;
-    tg.expand();
-
-    const userId = tg.initDataUnsafe?.user?.id || new URLSearchParams(window.location.search).get('user_id') || 0;
-
-    async function loadData() {
-      const res = await fetch(`/api/data?user_id=${userId}`);
-      const data = await res.json();
-
-      document.getElementById('currentMonth').innerText = data.month;
-      document.getElementById('totalIncome').innerText = `+€${data.income.toFixed(2)}`;
-      document.getElementById('totalExpense').innerText = `-€${data.expense.toFixed(2)}`;
-      document.getElementById('netBalance').innerText = `€${data.balance.toFixed(2)}`;
-
-      // Render Chart
-      const ctx = document.getElementById('expenseChart').getContext('2d');
-      new Chart(ctx, {
-        type: 'doughnut',
-        data: {
-          labels: data.categories.map(c => c.name),
-          datasets: [{
-            data: data.categories.map(c => c.value),
-            backgroundColor: ['#f43f5e', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#06b6d4', '#ec4899']
-          }]
-        },
-        options: {
-          responsive: true,
-          maintainAspectRatio: false,
-          plugins: {
-            legend: { position: 'bottom', labels: { color: '#cbd5e1', font: { size: 11 } } }
-          }
-        }
-      });
-
-      // Render Friends Balances
-      const fContainer = document.getElementById('friendsBalances');
-      if (data.friends && data.friends.length > 0) {
-        fContainer.innerHTML = '';
-        data.friends.forEach(f => {
-          const isCredit = f.balance > 0;
-          const color = isCredit ? 'text-emerald-400' : (f.balance < 0 ? 'text-rose-400' : 'text-slate-400');
-          const desc = isCredit ? 'ti deve' : 'devi dare';
-          fContainer.innerHTML += `
-            <div class="flex justify-between items-center py-1.5 border-b border-slate-700/50">
-              <span class="font-medium text-slate-200">${f.name}</span>
-              <span class="${color} font-semibold">${desc} €${Math.abs(f.balance).toFixed(2)}</span>
+    <div class="max-w-md mx-auto space-y-4">
+        <!-- Header con Bottone Refresh -->
+        <div class="flex justify-between items-center border-b border-slate-700 pb-3">
+            <div>
+                <h1 class="text-xl font-bold">📊 Bilancio</h1>
+                <span id="currentMonth" class="text-xs text-indigo-400 font-semibold">Caricamento...</span>
             </div>
-          `;
-        });
-      }
-    }
+            <button onclick="loadData(true)" id="refreshBtn" class="bg-slate-800 hover:bg-slate-700 border border-slate-600 px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center gap-1">
+        🔄 Aggiorna
+      </button>
+        </div>
 
-    loadData();
-  </script>
+        <!-- KPI Cards -->
+        <div class="grid grid-cols-3 gap-2">
+            <div class="bg-slate-800 p-3 rounded-xl border border-slate-700 text-center">
+                <p class="text-xs text-slate-400">Entrate</p>
+                <p id="totalIncome" class="text-sm font-bold text-emerald-400">--</p>
+            </div>
+            <div class="bg-slate-800 p-3 rounded-xl border border-slate-700 text-center">
+                <p class="text-xs text-slate-400">Uscite</p>
+                <p id="totalExpense" class="text-sm font-bold text-rose-400">--</p>
+            </div>
+            <div class="bg-slate-800 p-3 rounded-xl border border-slate-700 text-center">
+                <p class="text-xs text-slate-400">Saldo</p>
+                <p id="netBalance" class="text-sm font-bold text-indigo-400">--</p>
+            </div>
+        </div>
+
+        <!-- Chart Card -->
+        <div class="bg-slate-800 p-4 rounded-2xl border border-slate-700 space-y-2">
+            <h2 class="text-sm font-semibold text-slate-300">Spese per Categoria</h2>
+            <div class="relative h-64 w-full flex items-center justify-center">
+                <canvas id="expenseChart"></canvas>
+                <p id="noDataText" class="hidden text-xs text-slate-500">Nessuna spesa questo mese</p>
+            </div>
+        </div>
+
+        <!-- Debiti / Crediti Amici Card -->
+        <div class="bg-slate-800 p-4 rounded-2xl border border-slate-700 space-y-3">
+            <h2 class="text-sm font-semibold text-slate-300">👥 Saldi Amici</h2>
+            <div id="friendsBalances" class="space-y-2 text-xs">
+                <p class="text-slate-500">Caricamento saldi...</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const tg = window.Telegram.WebApp;
+        tg.ready();
+        tg.expand();
+
+        let chartInstance = null;
+        const userId = tg.initDataUnsafe ? .user ? .id || new URLSearchParams(window.location.search).get('user_id') || 0;
+
+        async function loadData(manual = false) {
+            const btn = document.getElementById('refreshBtn');
+            if (manual && btn) btn.innerText = '⏳...';
+
+            try {
+                const res = await fetch(`/api/data?user_id=${userId}&_t=${Date.now()}`);
+                const data = await res.json();
+
+                document.getElementById('currentMonth').innerText = data.month;
+                document.getElementById('totalIncome').innerText = `+€${data.income.toFixed(2)}`;
+                document.getElementById('totalExpense').innerText = `-€${data.expense.toFixed(2)}`;
+                document.getElementById('netBalance').innerText = `€${data.balance.toFixed(2)}`;
+
+                // Render o Aggiornamento Grafico
+                const ctx = document.getElementById('expenseChart').getContext('2d');
+                const noData = document.getElementById('noDataText');
+
+                if (!data.categories || data.categories.length === 0) {
+                    noData.classList.remove('hidden');
+                    if (chartInstance) chartInstance.destroy();
+                } else {
+                    noData.classList.add('hidden');
+                    if (chartInstance) chartInstance.destroy();
+
+                    chartInstance = new Chart(ctx, {
+                        type: 'doughnut',
+                        data: {
+                            labels: data.categories.map(c => c.name),
+                            datasets: [{
+                                data: data.categories.map(c => c.value),
+                                backgroundColor: ['#f43f5e', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#06b6d4', '#ec4899']
+                            }]
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: {
+                                legend: {
+                                    position: 'bottom',
+                                    labels: {
+                                        color: '#cbd5e1',
+                                        font: {
+                                            size: 11
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+
+                // Render Saldi Amici
+                const fContainer = document.getElementById('friendsBalances');
+                if (!data.friends || data.friends.length === 0) {
+                    fContainer.innerHTML = '<p class="text-slate-500">Nessun debito o credito aperto.</p>';
+                } else {
+                    fContainer.innerHTML = '';
+                    data.friends.forEach(f => {
+                        const isCredit = f.balance > 0;
+                        const color = isCredit ? 'text-emerald-400' : (f.balance < 0 ? 'text-rose-400' : 'text-slate-400');
+                        const desc = isCredit ? 'ti deve' : (f.balance < 0 ? 'devi dare' : 'in pari');
+                        fContainer.innerHTML += `
+              <div class="flex justify-between items-center py-1.5 border-b border-slate-700/50">
+                <span class="font-medium text-slate-200">${f.name}</span>
+                <span class="${color} font-semibold">${desc} €${Math.abs(f.balance).toFixed(2)}</span>
+              </div>
+            `;
+                    });
+                }
+            } catch (err) {
+                console.error("Errore fetch dashboard:", err);
+            } finally {
+                if (manual && btn) btn.innerText = '🔄 Aggiorna';
+            }
+        }
+
+        loadData();
+
+        // Ricarica automaticamente i dati quando la Mini App torna attiva
+        window.addEventListener('focus', () => loadData());
+    </script>
 </body>
+
 </html>
