@@ -1,0 +1,6 @@
+aiogram>=3.0.0
+google-genai
+python-dotenv
+aiohttp
+aiohttp-cors
+psycopg2-binary
