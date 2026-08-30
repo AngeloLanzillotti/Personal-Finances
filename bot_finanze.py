@@ -743,14 +743,12 @@ async def api_data(request):
     init_data = request.query.get("init_data", "")
 
     user_id = 0
-    # 1. Prova da query param ?user_id=...
     try:
         if raw_user_id and raw_user_id != "0":
             user_id = int(raw_user_id)
     except ValueError:
         user_id = 0
 
-    # 2. Se fallisce, prova dal payload firmato di Telegram initData
     if user_id == 0 and init_data:
         try:
             parsed = urllib.parse.parse_qs(init_data)
@@ -760,41 +758,47 @@ async def api_data(request):
         except Exception as e:
             logging.warning(f"Errore parsing init_data: {e}")
 
-    logging.info(f"📊 Richiesta Dashboard ricevuta per user_id: {user_id}")
+    logging.info(f"📊 Richiesta API Dashboard per user_id: {user_id}")
 
-    mese_corrente = datetime.now().strftime("%Y-%m")
+    mese_corrente = datetime.now().strftime("%Y-%m") # es: "2026-08"
 
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            # ENTRATE
+            # 1. ENTRATE (Conversione sicura ::text compatibile con Timestamp e Stringhe)
             cursor.execute("""
                 SELECT COALESCE(SUM(totale), 0.0) 
                 FROM transazioni 
-                WHERE user_id = %s AND data_ora LIKE %s AND tipo_movimento = 'ENTRATA'
-            """, (user_id, f"{mese_corrente}%"))
+                WHERE user_id = %s 
+                  AND (data_ora::text LIKE %s OR data_creazione::text LIKE %s)
+                  AND tipo_movimento = 'ENTRATA'
+            """, (user_id, f"{mese_corrente}%", f"{mese_corrente}%"))
             inc = float(cursor.fetchone()[0] or 0.0)
 
-            # USCITE
+            # 2. USCITE
             cursor.execute("""
                 SELECT COALESCE(SUM(totale), 0.0) 
                 FROM transazioni 
-                WHERE user_id = %s AND data_ora LIKE %s AND tipo_movimento = 'USCITA'
-            """, (user_id, f"{mese_corrente}%"))
+                WHERE user_id = %s 
+                  AND (data_ora::text LIKE %s OR data_creazione::text LIKE %s)
+                  AND tipo_movimento = 'USCITA'
+            """, (user_id, f"{mese_corrente}%", f"{mese_corrente}%"))
             exp = float(cursor.fetchone()[0] or 0.0)
 
-            # SPESE PER MACRO-CATEGORIA
+            # 3. SPESE PER MACRO-CATEGORIA
             cursor.execute("""
                 SELECT v.macro_categoria, SUM(v.prezzo_totale)
                 FROM voci_spesa v 
                 JOIN transazioni t ON v.transazione_id = t.id
-                WHERE t.user_id = %s AND t.data_ora LIKE %s AND t.tipo_movimento = 'USCITA'
+                WHERE t.user_id = %s 
+                  AND (t.data_ora::text LIKE %s OR t.data_creazione::text LIKE %s)
+                  AND t.tipo_movimento = 'USCITA'
                 GROUP BY v.macro_categoria
                 ORDER BY SUM(v.prezzo_totale) DESC
-            """, (user_id, f"{mese_corrente}%"))
+            """, (user_id, f"{mese_corrente}%", f"{mese_corrente}%"))
             cats = [{"name": r[0], "value": float(r[1])} for r in cursor.fetchall()]
 
-            # DEBITI / CREDITI AMICI
+            # 4. DEBITI / CREDITI AMICI
             cursor.execute("""
                 SELECT persona,
                        SUM(CASE WHEN tipo = 'HO_OFFERTO' THEN importo ELSE -importo END) AS saldo
@@ -814,7 +818,7 @@ async def api_data(request):
         "categories": cats,
         "friends": friends
     })
-    
+
 # --- TASK ANTI-SLEEP IN BACKGROUND (SELF-PING OGNI 10 MINUTI) ---
 async def self_ping_task():
     await asyncio.sleep(30) # Attende che il server sia completamente avviato
