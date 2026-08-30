@@ -20,6 +20,7 @@ from aiogram.filters import Command
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
+import urllib.parse
 
 load_dotenv()
 
@@ -29,6 +30,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "http://localhost:8080")
 
 os.makedirs("templates", exist_ok=True)
+os.makedirs("static", exist_ok=True)
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
@@ -737,23 +739,50 @@ async def web_health(request):
 
 async def api_data(request):
     user_id = request.query.get("user_id", "0")
+    init_data = request.query.get("init_data", "")
+
+    # Se l'user_id era 0 ma abbiamo init_data inviato dalla Mini App Telegram
+    if (user_id == "0" or not user_id) and init_data:
+        try:
+            parsed = urllib.parse.parse_qs(init_data)
+            if "user" in parsed:
+                user_json = json.loads(parsed["user"][0])
+                user_id = str(user_json.get("id", "0"))
+        except Exception as e:
+            logging.warning(f"Impossibile estrarre user da init_data: {e}")
+
+    try:
+        user_id_int = int(user_id)
+    except ValueError:
+        user_id_int = 0
+
     mese_corrente = datetime.now().strftime("%Y-%m")
 
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT COALESCE(SUM(totale), 0.0) FROM transazioni WHERE user_id = %s AND data_ora LIKE %s AND tipo_movimento = 'ENTRATA'", (user_id, f"{mese_corrente}%"))
+            cursor.execute("""
+                SELECT COALESCE(SUM(totale), 0.0) 
+                FROM transazioni 
+                WHERE user_id = %s AND data_ora LIKE %s AND tipo_movimento = 'ENTRATA'
+            """, (user_id_int, f"{mese_corrente}%"))
             inc = float(cursor.fetchone()[0])
 
-            cursor.execute("SELECT COALESCE(SUM(totale), 0.0) FROM transazioni WHERE user_id = %s AND data_ora LIKE %s AND tipo_movimento = 'USCITA'", (user_id, f"{mese_corrente}%"))
+            cursor.execute("""
+                SELECT COALESCE(SUM(totale), 0.0) 
+                FROM transazioni 
+                WHERE user_id = %s AND data_ora LIKE %s AND tipo_movimento = 'USCITA'
+            """, (user_id_int, f"{mese_corrente}%"))
             exp = float(cursor.fetchone()[0])
 
             cursor.execute("""
                 SELECT v.macro_categoria, SUM(v.prezzo_totale)
-                FROM voci_spesa v JOIN transazioni t ON v.transazione_id = t.id
+                FROM voci_spesa v 
+                JOIN transazioni t ON v.transazione_id = t.id
                 WHERE t.user_id = %s AND t.data_ora LIKE %s AND t.tipo_movimento = 'USCITA'
                 GROUP BY v.macro_categoria
-            """, (user_id, f"{mese_corrente}%"))
+                ORDER BY SUM(v.prezzo_totale) DESC
+            """, (user_id_int, f"{mese_corrente}%"))
             cats = [{"name": r[0], "value": float(r[1])} for r in cursor.fetchall()]
 
             cursor.execute("""
@@ -762,7 +791,7 @@ async def api_data(request):
                 FROM debiti_crediti
                 WHERE user_id = %s
                 GROUP BY persona
-            """, (user_id,))
+            """, (user_id_int,))
             friends = [{"name": r[0], "balance": float(r[1] or 0.0)} for r in cursor.fetchall()]
     finally:
         release_db_connection(conn)
@@ -803,8 +832,12 @@ async def main():
     app = web.Application()
     cors = aiohttp_cors.setup(app, defaults={"*": aiohttp_cors.ResourceOptions(allow_credentials=True, expose_headers="*", allow_headers="*")})
     
+    # Routing Pagine e Statici
     app.router.add_get("/", web_index)
     app.router.add_get("/health", web_health)
+    app.router.add_static("/static/", path="static", name="static")
+
+    # Routing API con CORS
     resource = cors.add(app.router.add_resource("/api/data"))
     cors.add(resource.add_route("GET", api_data))
 
@@ -815,10 +848,9 @@ async def main():
     await site.start()
     print(f"🌐 Dashboard Web Server avviato sulla porta {port}")
 
-    # Avvio del task anti-sleep in background
     asyncio.create_task(self_ping_task())
 
-    print("🚀 Bot Finanze Personali (PostgreSQL / Supabase + Anti-Sleep) sincronizzato e operativo!")
+    print("🚀 Bot Finanze Personali sincronizzato e operativo!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
