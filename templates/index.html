@@ -19,8 +19,8 @@
                 <span id="currentMonth" class="text-xs text-indigo-400 font-semibold">Caricamento...</span>
             </div>
             <button onclick="loadData(true)" id="refreshBtn" class="bg-slate-800 hover:bg-slate-700 border border-slate-600 px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center gap-1">
-        🔄 Aggiorna
-      </button>
+                🔄 Aggiorna
+            </button>
         </div>
 
         <!-- KPI Cards -->
@@ -63,7 +63,14 @@
         tg.expand();
 
         let chartInstance = null;
-        const userId = tg.initDataUnsafe ? .user ? .id || new URLSearchParams(window.location.search).get('user_id') || 0;
+
+        // Estrazione sicura user_id da Telegram WebApp o query param
+        let userId = 0;
+        if (tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) {
+            userId = tg.initDataUnsafe.user.id;
+        } else {
+            userId = new URLSearchParams(window.location.search).get('user_id') || 0;
+        }
 
         async function loadData(manual = false) {
             const btn = document.getElementById('refreshBtn');
@@ -127,11 +134,11 @@
                         const color = isCredit ? 'text-emerald-400' : (f.balance < 0 ? 'text-rose-400' : 'text-slate-400');
                         const desc = isCredit ? 'ti deve' : (f.balance < 0 ? 'devi dare' : 'in pari');
                         fContainer.innerHTML += `
-              <div class="flex justify-between items-center py-1.5 border-b border-slate-700/50">
-                <span class="font-medium text-slate-200">${f.name}</span>
-                <span class="${color} font-semibold">${desc} €${Math.abs(f.balance).toFixed(2)}</span>
-              </div>
-            `;
+                            <div class="flex justify-between items-center py-1.5 border-b border-slate-700/50">
+                                <span class="font-medium text-slate-200">${f.name}</span>
+                                <span class="${color} font-semibold">${desc} €${Math.abs(f.balance).toFixed(2)}</span>
+                            </div>
+                        `;
                     });
                 }
             } catch (err) {
