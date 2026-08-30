@@ -1,14 +1,16 @@
 import os
 import re
 import json
+import asyncio
 import logging
 import html
 import hashlib
+import aiohttp
 from datetime import datetime
 from aiohttp import web
 import aiohttp_cors
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2 import pool
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, ReplyKeyboardMarkup, KeyboardButton, BotCommand, WebAppInfo
@@ -34,12 +36,18 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 logging.basicConfig(level=logging.INFO)
 
-# --- CONNESSIONE A POSTGRESQL (SUPABASE) ---
+# --- CONNECTION POOLING PER POSTGRESQL (VELOCIZZA LE QUERY) ---
+db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DATABASE_URL)
+
 def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
+    return db_pool.getconn()
+
+def release_db_connection(conn):
+    db_pool.putconn(conn)
 
 def init_db():
-    with get_db_connection() as conn:
+    conn = get_db_connection()
+    try:
         with conn.cursor() as cursor:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS transazioni (
@@ -94,6 +102,8 @@ def init_db():
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_transazioni_user_data ON transazioni(user_id, data_ora);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_debiti_user ON debiti_crediti(user_id);")
             conn.commit()
+    finally:
+        release_db_connection(conn)
 
 init_db()
 
@@ -327,7 +337,8 @@ async def btn_report_mese(message: Message):
     user_id = message.from_user.id
     mese_corrente = datetime.now().strftime("%Y-%m")
 
-    with get_db_connection() as conn:
+    conn = get_db_connection()
+    try:
         with conn.cursor() as cursor:
             cursor.execute("""
                 SELECT COALESCE(SUM(totale), 0.0), COUNT(id) 
@@ -358,6 +369,8 @@ async def btn_report_mese(message: Message):
                 ORDER BY SUM(v.prezzo_totale) DESC
             """, (user_id, f"{mese_corrente}%"))
             macro_uscite = cursor.fetchall()
+    finally:
+        release_db_connection(conn)
 
     testo = f"📊 <b>Bilancio Finanziario - {datetime.now().strftime('%m/%Y')}</b>\n\n"
     testo += f"🟢 <b>Entrate:</b> +€{totale_entrate:.2f} (<i>{num_entrate} accrediti</i>)\n"
@@ -384,7 +397,8 @@ async def btn_report_mese(message: Message):
 @dp.message(F.text == "👥 Debiti & Amici")
 async def btn_amici(message: Message):
     user_id = message.from_user.id
-    with get_db_connection() as conn:
+    conn = get_db_connection()
+    try:
         with conn.cursor() as cursor:
             cursor.execute("""
                 SELECT persona,
@@ -395,6 +409,8 @@ async def btn_amici(message: Message):
                 GROUP BY persona
             """, (user_id,))
             rows = cursor.fetchall()
+    finally:
+        release_db_connection(conn)
 
     if not rows:
         await message.reply("Nessun debito o credito registrato con gli amici.", reply_markup=get_main_keyboard())
@@ -421,7 +437,8 @@ async def btn_spese_categoria(message: Message):
     user_id = message.from_user.id
     mese_corrente = datetime.now().strftime("%Y-%m")
 
-    with get_db_connection() as conn:
+    conn = get_db_connection()
+    try:
         with conn.cursor() as cursor:
             cursor.execute("""
                 SELECT t.tipo_movimento, v.macro_categoria, COALESCE(v.sotto_categoria, 'Altro'), SUM(v.prezzo_totale)
@@ -432,6 +449,8 @@ async def btn_spese_categoria(message: Message):
                 ORDER BY t.tipo_movimento DESC, v.macro_categoria ASC, SUM(v.prezzo_totale) DESC
             """, (user_id, f"{mese_corrente}%"))
             righe = cursor.fetchall()
+    finally:
+        release_db_connection(conn)
 
     if not righe:
         await message.reply("Nessun movimento registrato per questo mese.", reply_markup=get_main_keyboard())
@@ -473,7 +492,8 @@ async def btn_spese_categoria(message: Message):
 @dp.message(F.text == "📋 Ultime Operazioni")
 async def btn_ultime_spese(message: Message):
     user_id = message.from_user.id
-    with get_db_connection() as conn:
+    conn = get_db_connection()
+    try:
         with conn.cursor() as cursor:
             cursor.execute("""
                 SELECT id, data_ora, tipo_movimento, esercente, totale, metodo_pagamento, tipo_inserimento, note
@@ -482,6 +502,8 @@ async def btn_ultime_spese(message: Message):
                 ORDER BY id DESC LIMIT 8
             """, (user_id,))
             transazioni = cursor.fetchall()
+    finally:
+        release_db_connection(conn)
 
     if not transazioni:
         await message.reply("Nessuna operazione registrata finora.", reply_markup=get_main_keyboard())
@@ -510,10 +532,8 @@ async def handle_nlp_text(message: Message):
     testo_utente = message.text.strip()
     user_id = message.from_user.id
 
-    # 1. Tentativo con Parser Locale
     dati = parse_local_text(testo_utente)
 
-    # 2. Fallback su Gemini 3.6 Flash se non riconosciuto
     if not dati or not dati.get("is_valid", False):
         try:
             response = ai_client.models.generate_content(
@@ -541,7 +561,8 @@ async def handle_nlp_text(message: Message):
     esercente = dati.get("esercente") or "Manuale"
     data_ora = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    with get_db_connection() as conn:
+    conn = get_db_connection()
+    try:
         with conn.cursor() as cursor:
 
             def get_friend_net_balance(cur, uid, p_name):
@@ -629,6 +650,8 @@ async def handle_nlp_text(message: Message):
                 VALUES (%s, %s, 1.0, %s, %s, %s, %s)
             """, (t_id, descrizione, importo, importo, macro_cat, sotto_cat))
             conn.commit()
+    finally:
+        release_db_connection(conn)
 
     icona = "🟢 <b>Entrata registrata!</b>" if tipo_mov == "ENTRATA" else "🔴 <b>Spesa registrata!</b>"
     await message.reply(
@@ -651,10 +674,14 @@ async def handle_receipt(message: Message):
         image_data = photo_bytes.read()
         image_hash = hashlib.sha256(image_data).hexdigest()
 
-        with get_db_connection() as conn:
+        conn = get_db_connection()
+        try:
             with conn.cursor() as cursor:
                 cursor.execute("SELECT id, data_creazione FROM transazioni WHERE user_id = %s AND image_hash = %s", (user_id, image_hash))
                 dup = cursor.fetchone()
+        finally:
+            release_db_connection(conn)
+
         if dup:
             await status_msg.edit_text(f"⚠️ Scontrino già registrato il {dup[1]}.", parse_mode=ParseMode.HTML)
             return
@@ -677,7 +704,8 @@ async def handle_receipt(message: Message):
         totale = float(pagamento.get("totale", 0.0))
         data_ora = fiscale.get("data_ora") or datetime.now().strftime("%Y-%m-%d %H:%M")
 
-        with get_db_connection() as conn:
+        conn = get_db_connection()
+        try:
             with conn.cursor() as cursor:
                 cursor.execute("""
                     INSERT INTO transazioni (user_id, data_ora, tipo_movimento, tipo_inserimento, esercente, categoria_esercente, citta, piva, totale, totale_sconti, metodo_pagamento, numero_documento, matricola_rt, image_hash)
@@ -691,6 +719,8 @@ async def handle_receipt(message: Message):
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     """, (t_id, a.get("nome"), float(a.get("quantita", 1)), float(a.get("prezzo_unitario", 0)), float(a.get("prezzo_totale", 0)), float(a.get("sconto", 0)), a.get("macro_categoria", "ALTRO"), a.get("sotto_categoria", "Altro")))
                 conn.commit()
+        finally:
+            release_db_connection(conn)
 
         await status_msg.edit_text(f"🧾 <b>Scontrino Registrato!</b>\n🏬 {html.escape(str(esercente.get('nome')))}\n💰 Totale: €{totale:.2f}\n📋 Articoli: {len(articoli)} voci.", parse_mode=ParseMode.HTML)
     except Exception as e:
@@ -702,11 +732,15 @@ async def web_index(request):
     with open("templates/index.html", "r", encoding="utf-8") as f:
         return web.Response(text=f.read(), content_type="text/html")
 
+async def web_health(request):
+    return web.Response(text="OK", status=200)
+
 async def api_data(request):
     user_id = request.query.get("user_id", "0")
     mese_corrente = datetime.now().strftime("%Y-%m")
 
-    with get_db_connection() as conn:
+    conn = get_db_connection()
+    try:
         with conn.cursor() as cursor:
             cursor.execute("SELECT COALESCE(SUM(totale), 0.0) FROM transazioni WHERE user_id = %s AND data_ora LIKE %s AND tipo_movimento = 'ENTRATA'", (user_id, f"{mese_corrente}%"))
             inc = float(cursor.fetchone()[0])
@@ -730,6 +764,8 @@ async def api_data(request):
                 GROUP BY persona
             """, (user_id,))
             friends = [{"name": r[0], "balance": float(r[1] or 0.0)} for r in cursor.fetchall()]
+    finally:
+        release_db_connection(conn)
 
     return web.json_response({
         "month": datetime.now().strftime("%m/%Y"),
@@ -740,6 +776,26 @@ async def api_data(request):
         "friends": friends
     })
 
+# --- TASK ANTI-SLEEP IN BACKGROUND (SELF-PING OGNI 10 MINUTI) ---
+async def self_ping_task():
+    await asyncio.sleep(30) # Attende che il server sia completamente avviato
+    if not WEBAPP_URL.startswith("https://"):
+        return # Non esegue il ping se si trova in ambiente locale http://
+
+    ping_url = f"{WEBAPP_URL}/health"
+    logging.info(f"🔄 Task Anti-Sleep avviato: ping attivo su {ping_url}")
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get(ping_url, timeout=10) as resp:
+                    if resp.status == 200:
+                        logging.info("💓 Anti-Sleep Self-Ping inviato con successo (200 OK).")
+            except Exception as e:
+                logging.warning(f"⚠️ Errore durante Self-Ping: {e}")
+            
+            await asyncio.sleep(600) # Ripete ogni 10 minuti esatti (600 secondi)
+
 # --- AVVIO CONGIUNTO BOT + WEB SERVER ---
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
@@ -748,6 +804,7 @@ async def main():
     cors = aiohttp_cors.setup(app, defaults={"*": aiohttp_cors.ResourceOptions(allow_credentials=True, expose_headers="*", allow_headers="*")})
     
     app.router.add_get("/", web_index)
+    app.router.add_get("/health", web_health)
     resource = cors.add(app.router.add_resource("/api/data"))
     cors.add(resource.add_route("GET", api_data))
 
@@ -758,9 +815,11 @@ async def main():
     await site.start()
     print(f"🌐 Dashboard Web Server avviato sulla porta {port}")
 
-    print("🚀 Bot Finanze Personali (PostgreSQL / Supabase) sincronizzato e operativo!")
+    # Avvio del task anti-sleep in background
+    asyncio.create_task(self_ping_task())
+
+    print("🚀 Bot Finanze Personali (PostgreSQL / Supabase + Anti-Sleep) sincronizzato e operativo!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
