@@ -6,13 +6,6 @@ if (tg) {
 
 var chartInstance = null;
 
-function logDebug(msg) {
-    var el = document.getElementById('debugLog');
-    if (el) {
-        el.innerHTML += '<div>' + msg + '</div>';
-    }
-}
-
 function getUserId() {
     var urlParams = new URLSearchParams(window.location.search);
     var uidFromUrl = urlParams.get('user_id');
@@ -33,27 +26,13 @@ async function loadData(manual) {
         btn.innerText = '⏳...';
     }
 
-    var logEl = document.getElementById('debugLog');
-    if (logEl) logEl.innerHTML = '';
-
     var userId = getUserId();
     var initDataRaw = (tg && tg.initData) ? tg.initData : '';
 
-    logDebug('🔍 Rilevato User ID: ' + userId);
-    logDebug('📦 URL Search: ' + (window.location.search || 'Nessun parametro'));
-
     try {
         var fetchUrl = '/api/data?user_id=' + userId + '&init_data=' + encodeURIComponent(initDataRaw) + '&_t=' + Date.now();
-        logDebug('🌐 Chiamata a: ' + fetchUrl);
-
         var res = await fetch(fetchUrl);
         var data = await res.json();
-
-        logDebug('✅ Risposta API: ' + JSON.stringify(data));
-
-        if (data.error) {
-            logDebug('❌ Errore Backend: ' + data.error);
-        }
 
         document.getElementById('currentMonth').innerText = data.month || '--';
         document.getElementById('totalIncome').innerText = '+€' + (data.income || 0).toFixed(2);
@@ -122,8 +101,7 @@ async function loadData(manual) {
             });
         }
     } catch (err) {
-        logDebug('❌ Errore Fetch JS: ' + err.message);
-        console.error("Errore fetch dashboard:", err);
+        console.error("Errore caricamento dati dashboard:", err);
     } finally {
         if (manual && btn) {
             btn.innerText = '🔄 Aggiorna';
