@@ -13,7 +13,8 @@ import psycopg2
 from psycopg2 import pool
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
-    Message, ReplyKeyboardMarkup, KeyboardButton, BotCommand, WebAppInfo
+    Message, ReplyKeyboardMarkup, KeyboardButton, BotCommand, WebAppInfo,
+    InlineKeyboardMarkup, InlineKeyboardButton
 )
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
@@ -267,16 +268,11 @@ def parse_local_text(text: str):
     }
 
 # --- TASTIERA DI CONTROLLO CON USER_ID DINAMICO ---
-def get_main_keyboard(user_id: int = 0):
-    if WEBAPP_URL.startswith("https://"):
-        target_url = f"{WEBAPP_URL}/?user_id={user_id}"
-        dashboard_btn = KeyboardButton(text="📱 Apri Dashboard", web_app=WebAppInfo(url=target_url))
-    else:
-        dashboard_btn = KeyboardButton(text="📱 Link Dashboard")
-
+# --- TASTIERA DI CONTROLLO FISSA ---
+def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [dashboard_btn, KeyboardButton(text="📊 Report Mese")],
+            [KeyboardButton(text="📱 Apri Dashboard"), KeyboardButton(text="📊 Report Mese")],
             [KeyboardButton(text="👥 Debiti & Amici"), KeyboardButton(text="🏷️ Spese per Categoria")],
             [KeyboardButton(text="📋 Ultime Operazioni"), KeyboardButton(text="ℹ️ Guida Inserimento")]
         ],
@@ -284,18 +280,24 @@ def get_main_keyboard(user_id: int = 0):
         persistent=True
     )
 
-# --- BOTTONE LINK DASHBOARD ---
+# --- HANDLER BOTTONE DASHBOARD CON ID DINAMICO ---
 @dp.message(Command("dashboard"))
-@dp.message(F.text.in_(["📱 Link Dashboard", "📱 Apri Dashboard"]))
+@dp.message(F.text == "📱 Apri Dashboard")
 async def btn_link_dashboard(message: Message):
     user_id = message.from_user.id
-    url = f"{WEBAPP_URL}/?user_id={user_id}"
-    testo = (
-        "📊 <b>Dashboard Finanziaria Interattiva</b>\n\n"
-        f"Visualizza bilancio, categorie e saldi amici qui:\n"
-        f"👉 <a href='{url}'>{url}</a>"
+    target_url = f"{WEBAPP_URL}/?user_id={user_id}"
+
+    inline_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🚀 Apri Mini App", web_app=WebAppInfo(url=target_url))]
+        ]
     )
-    await message.reply(testo, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+    testo = (
+        "📊 <b>Dashboard Finanziaria Personale</b>\n\n"
+        "Premi il pulsante qui sotto per avviare la Mini App con i tuoi dati:"
+    )
+    await message.reply(testo, parse_mode=ParseMode.HTML, reply_markup=inline_kb)
 
 # --- GUIDA INSERIMENTO ---
 @dp.message(Command("guida"))
