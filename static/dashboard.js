@@ -7,14 +7,19 @@ if (tg) {
 var chartInstance = null;
 
 function getUserId() {
+    // 1. Prova da URL query param ?user_id=123456
+    var urlParams = new URLSearchParams(window.location.search);
+    var uidFromUrl = urlParams.get('user_id');
+    if (uidFromUrl && uidFromUrl !== '0') {
+        return uidFromUrl;
+    }
+
+    // 2. Prova da Telegram WebApp object
     if (tg && tg.initDataUnsafe && tg.initDataUnsafe.user && tg.initDataUnsafe.user.id) {
         return tg.initDataUnsafe.user.id;
     }
-    var urlParam = new URLSearchParams(window.location.search).get('user_id');
-    if (urlParam) {
-        return urlParam;
-    }
-    return null;
+
+    return 0;
 }
 
 async function loadData(manual) {
@@ -27,7 +32,7 @@ async function loadData(manual) {
     var initDataRaw = (tg && tg.initData) ? tg.initData : '';
 
     try {
-        var res = await fetch('/api/data?user_id=' + (userId || 0) + '&init_data=' + encodeURIComponent(initDataRaw) + '&_t=' + Date.now());
+        var res = await fetch('/api/data?user_id=' + userId + '&init_data=' + encodeURIComponent(initDataRaw) + '&_t=' + Date.now());
         var data = await res.json();
 
         document.getElementById('currentMonth').innerText = data.month || '--';
@@ -47,6 +52,7 @@ async function loadData(manual) {
             noData.classList.remove('hidden');
             if (chartInstance) {
                 chartInstance.destroy();
+                chartInstance = null;
             }
         } else {
             noData.classList.add('hidden');

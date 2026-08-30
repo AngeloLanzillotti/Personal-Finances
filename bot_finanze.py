@@ -266,10 +266,11 @@ def parse_local_text(text: str):
         "sotto_categoria": sotto, "metodo_pagamento": metodo, "esercente": "Manuale"
     }
 
-# --- TASTIERA DI CONTROLLO (6 TASTI RAPIDI) ---
-def get_main_keyboard():
+# --- TASTIERA DI CONTROLLO CON USER_ID DINAMICO ---
+def get_main_keyboard(user_id: int = 0):
     if WEBAPP_URL.startswith("https://"):
-        dashboard_btn = KeyboardButton(text="📱 Apri Dashboard", web_app=WebAppInfo(url=f"{WEBAPP_URL}/"))
+        target_url = f"{WEBAPP_URL}/?user_id={user_id}"
+        dashboard_btn = KeyboardButton(text="📱 Apri Dashboard", web_app=WebAppInfo(url=target_url))
     else:
         dashboard_btn = KeyboardButton(text="📱 Link Dashboard")
 
@@ -738,43 +739,51 @@ async def web_health(request):
     return web.Response(text="OK", status=200)
 
 async def api_data(request):
-    user_id = request.query.get("user_id", "0")
+    raw_user_id = request.query.get("user_id", "0")
     init_data = request.query.get("init_data", "")
 
-    # Se l'user_id era 0 ma abbiamo init_data inviato dalla Mini App Telegram
-    if (user_id == "0" or not user_id) and init_data:
+    user_id = 0
+    # 1. Prova da query param ?user_id=...
+    try:
+        if raw_user_id and raw_user_id != "0":
+            user_id = int(raw_user_id)
+    except ValueError:
+        user_id = 0
+
+    # 2. Se fallisce, prova dal payload firmato di Telegram initData
+    if user_id == 0 and init_data:
         try:
             parsed = urllib.parse.parse_qs(init_data)
             if "user" in parsed:
-                user_json = json.loads(parsed["user"][0])
-                user_id = str(user_json.get("id", "0"))
+                user_dict = json.loads(parsed["user"][0])
+                user_id = int(user_dict.get("id", 0))
         except Exception as e:
-            logging.warning(f"Impossibile estrarre user da init_data: {e}")
+            logging.warning(f"Errore parsing init_data: {e}")
 
-    try:
-        user_id_int = int(user_id)
-    except ValueError:
-        user_id_int = 0
+    logging.info(f"📊 Richiesta Dashboard ricevuta per user_id: {user_id}")
 
     mese_corrente = datetime.now().strftime("%Y-%m")
 
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
+            # ENTRATE
             cursor.execute("""
                 SELECT COALESCE(SUM(totale), 0.0) 
                 FROM transazioni 
                 WHERE user_id = %s AND data_ora LIKE %s AND tipo_movimento = 'ENTRATA'
-            """, (user_id_int, f"{mese_corrente}%"))
-            inc = float(cursor.fetchone()[0])
+            """, (user_id, f"{mese_corrente}%"))
+            inc = float(cursor.fetchone()[0] or 0.0)
 
+            # USCITE
             cursor.execute("""
                 SELECT COALESCE(SUM(totale), 0.0) 
                 FROM transazioni 
                 WHERE user_id = %s AND data_ora LIKE %s AND tipo_movimento = 'USCITA'
-            """, (user_id_int, f"{mese_corrente}%"))
-            exp = float(cursor.fetchone()[0])
+            """, (user_id, f"{mese_corrente}%"))
+            exp = float(cursor.fetchone()[0] or 0.0)
 
+            # SPESE PER MACRO-CATEGORIA
             cursor.execute("""
                 SELECT v.macro_categoria, SUM(v.prezzo_totale)
                 FROM voci_spesa v 
@@ -782,16 +791,17 @@ async def api_data(request):
                 WHERE t.user_id = %s AND t.data_ora LIKE %s AND t.tipo_movimento = 'USCITA'
                 GROUP BY v.macro_categoria
                 ORDER BY SUM(v.prezzo_totale) DESC
-            """, (user_id_int, f"{mese_corrente}%"))
+            """, (user_id, f"{mese_corrente}%"))
             cats = [{"name": r[0], "value": float(r[1])} for r in cursor.fetchall()]
 
+            # DEBITI / CREDITI AMICI
             cursor.execute("""
                 SELECT persona,
                        SUM(CASE WHEN tipo = 'HO_OFFERTO' THEN importo ELSE -importo END) AS saldo
                 FROM debiti_crediti
                 WHERE user_id = %s
                 GROUP BY persona
-            """, (user_id_int,))
+            """, (user_id,))
             friends = [{"name": r[0], "balance": float(r[1] or 0.0)} for r in cursor.fetchall()]
     finally:
         release_db_connection(conn)
@@ -804,7 +814,7 @@ async def api_data(request):
         "categories": cats,
         "friends": friends
     })
-
+    
 # --- TASK ANTI-SLEEP IN BACKGROUND (SELF-PING OGNI 10 MINUTI) ---
 async def self_ping_task():
     await asyncio.sleep(30) # Attende che il server sia completamente avviato
