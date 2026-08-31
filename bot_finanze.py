@@ -6,6 +6,7 @@ import logging
 import html
 import hashlib
 import aiohttp
+import urllib.parse
 from datetime import datetime
 from aiohttp import web
 import aiohttp_cors
@@ -13,15 +14,14 @@ import psycopg2
 from psycopg2 import pool
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
-    Message, ReplyKeyboardMarkup, KeyboardButton, BotCommand, WebAppInfo,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    Message, ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo, CallbackQuery
 )
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
-import urllib.parse
 
 load_dotenv()
 
@@ -39,7 +39,7 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 logging.basicConfig(level=logging.INFO)
 
-# --- CONNECTION POOLING PER POSTGRESQL (VELOCIZZA LE QUERY) ---
+# --- CONNECTION POOLING ---
 db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DATABASE_URL)
 
 def get_db_connection():
@@ -102,73 +102,69 @@ def init_db():
                 );
             """)
 
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS collette_regali (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    nome_regalo TEXT NOT NULL,
+                    destinatario TEXT,
+                    totale_anticipato NUMERIC(10, 2) NOT NULL,
+                    quota_singola NUMERIC(10, 2) NOT NULL,
+                    partecipanti_totali TEXT[] NOT NULL,
+                    partecipanti_pagati TEXT[] DEFAULT '{}',
+                    completato BOOLEAN DEFAULT FALSE,
+                    data_ora TEXT NOT NULL,
+                    data_creazione TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_transazioni_user_data ON transazioni(user_id, data_ora);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_debiti_user ON debiti_crediti(user_id);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_collette_user ON collette_regali(user_id);")
             conn.commit()
     finally:
         release_db_connection(conn)
 
 init_db()
 
-# --- PROMPT AI PER SCONTRINI ---
-RECEIPT_PROMPT = """
-Sei un assistente contabile personale per l'estrazione analitica di spese da scontrini commerciali.
-Restituisci ESCLUSIVAMENTE un JSON valido conforme a questo schema:
-{
-  "is_receipt": boolean,
-  "esercente": {
-    "nome": "Nome negozio/insegna o 'Sconosciuto'",
-    "categoria": "SUPERMERCATO" | "TABACCHERIA" | "FARMACIA" | "RISTORANTE_BAR" | "ELETTRONICA" | "ABBIGLIAMENTO" | "CASA_BRICO" | "TRASPORTI" | "ALTRO",
-    "citta": "Città se visibile o null",
-    "piva": "P.IVA/CF esercente se visibile o null"
-  },
-  "fiscale": {
-    "data_ora": "YYYY-MM-DD HH:MM oppure null",
-    "numero_documento": "Numero documento commerciale o null",
-    "matricola_rt": "Matricola RT registratore o null"
-  },
-  "pagamento": {
-    "totale": float,
-    "totale_sconti": float,
-    "metodo": "CARTA" | "CONTANTI" | "BUONI_PASTO" | "ALTRO" | "NON_SPECIFICATO"
-  },
-  "articoli": [
-    {
-      "nome": "Nome articolo normalizzato",
-      "quantita": float,
-      "prezzo_unitario": float,
-      "prezzo_totale": float,
-      "sconto": float,
-      "macro_categoria": "FUMO" | "ALIMENTARI" | "CASA_PULIZIA" | "SALUTE_CURA" | "RISTORAZIONE" | "SVAGO_CULTURA" | "TECNOLOGIA" | "ABBIGLIAMENTO" | "TRASPORTI" | "ALTRO",
-      "sotto_categoria": "es. Sigarette, Terea, Tabacco, Filtri, Cartine, Snus, Latticini, Carne, Bevande Alcoliche, ecc."
-    }
-  ]
-}
-
-Regole:
-1. Se non è uno scontrino: "is_receipt": false.
-2. Per FUMO: macro "FUMO", sotto-categorie (Sigarette, Terea, Tabacco, Filtri, Cartine, Snus).
-3. Per BEVANDE: 'Bevande Alcoliche' o 'Bevande Analcoliche'.
-4. Gestisci moltiplicatori (es. '3 x 1.50' o 'Pz. 3').
-"""
-
+# --- PROMPT AI NLP CON GESTIONE REGALI E ANTICIPI ---
 NLP_EXPENSE_PROMPT = """
-Analizza il messaggio dell'utente che descrive una transazione finanziaria.
-Restituisci ESCLUSIVAMENTE un JSON valido conforme a questo schema:
+Sei il modulo contabile di analisi finanziaria. Analizza la frase e restituisci ESCLUSIVAMENTE un JSON valido:
 {
   "is_valid": boolean,
-  "tipo_movimento": "USCITA" | "ENTRATA" | "HO_OFFERTO" | "MI_HA_OFFERTO",
-  "persona_coinvolta": "Nome della persona o null",
-  "descrizione": "Nome specifico dell'articolo o movimento",
+  "tipo_movimento": "USCITA" | "ENTRATA" | "HO_OFFERTO" | "MI_HA_OFFERTO" | "ANTICIPO_REGALO" | "SALDO_RICEVUTO",
+  "persona_coinvolta": "Nome singolo partecipante o mittente (null se lista)",
+  "partecipanti": ["Nome1", "Nome2", "Nome3"],
+  "destinatario_regalo": "A chi è destinato il regalo (es. Alessio)",
+  "descrizione": "Descrizione accurata della spesa",
   "importo": float,
-  "macro_categoria": "ENTRATE" | "FUMO" | "ALIMENTARI" | "RISTORAZIONE" | "CASA_PULIZIA" | "SALUTE_CURA" | "SVAGO_CULTURA" | "TECNOLOGIA" | "ABBIGLIAMENTO" | "TRASPORTI" | "ALTRO",
+  "macro_categoria": "ENTRATE" | "REGALI_COLLETTE" | "FUMO" | "ALIMENTARI" | "RISTORAZIONE" | "CASA_PULIZIA" | "SALUTE_CURA" | "SVAGO_CULTURA" | "TECNOLOGIA" | "ABBIGLIAMENTO" | "TRASPORTI" | "ALTRO",
   "sotto_categoria": "Sotto-categoria precisa",
   "metodo_pagamento": "CARTA" | "CONTANTI" | "BONIFICO" | "NON_SPECIFICATO",
-  "esercente": "Nome locale o fonte se specificato"
+  "esercente": "Nome negozio/fonte o 'Manuale'"
+}
+
+Regole fondamentali:
+1. ANTICIPI / REGALI PER ALTRI: Se l'utente scrive 'Anticipo per...', 'Comprato regalo per...', 'Ho anticipato 40 per il regalo di Alessio a Marco e Luca':
+   - tipo_movimento = "ANTICIPO_REGALO"
+   - macro_categoria = "REGALI_COLLETTE"
+   - importo = totale speso dall'utente (è un'uscita monetaria totale)
+   - partecipanti = lista dei nomi che devono restituire la quota. Se non specifica altri partecipanti, il partecipante è il destinatario o la persona citata.
+2. REGALO RICEVUTO: SOLO se dice esplicitamente 'Ricevuto regalo', 'Regalo di compleanno dai nonni', 'Regalo ricevuto 50' -> tipo_movimento = "ENTRATA".
+3. SALDI RICEVUTI: Se dice 'Marco mi ha dato 20 per il regalo', 'Simone mi ha ridato 10' -> tipo_movimento = "SALDO_RICEVUTO".
+"""
+
+RECEIPT_PROMPT = """
+Sei un assistente per l'estrazione dati da scontrini. Restituisci ESCLUSIVAMENTE un JSON valido:
+{
+  "is_receipt": boolean,
+  "esercente": { "nome": "Nome", "categoria": "SUPERMERCATO" | "TABACCHERIA" | "FARMACIA" | "RISTORANTE_BAR" | "ALTRO", "citta": null, "piva": null },
+  "fiscale": { "data_ora": "YYYY-MM-DD HH:MM", "numero_documento": null, "matricola_rt": null },
+  "pagamento": { "totale": float, "totale_sconti": float, "metodo": "CARTA" | "CONTANTI" | "NON_SPECIFICATO" },
+  "articoli": [ { "nome": "Item", "quantita": float, "prezzo_unitario": float, "prezzo_totale": float, "sconto": float, "macro_categoria": "FUMO" | "ALIMENTARI" | "RISTORAZIONE" | "ALTRO", "sotto_categoria": "Sub" } ]
 }
 """
 
-# --- PARSER LOCALE VELOCE ---
 def parse_local_text(text: str):
     text_clean = text.strip()
     match_num = re.search(r'(\d+[\.,]?\d*)', text_clean)
@@ -195,31 +191,22 @@ def parse_local_text(text: str):
 
     tokens_lower = tokens.lower()
 
-    # 1. CASO: HO OFFERTO A QUALCUNO
-    offerto_match = re.search(r'(?:offert[oaei]|pagat[oaei]|offro|pago)\s+(?:a\s+)?([a-zA-Zàèéìòù]+)', tokens, re.I)
-    if offerto_match:
-        persona = offerto_match.group(1).capitalize()
-        desc_clean = re.sub(r'(?:offert[oaei]|pagat[oaei]|offro|pago)\s+(?:a\s+)?[a-zA-Zàèéìòù]+', '', tokens, flags=re.I).strip()
-        desc = desc_clean.capitalize() or "Offerta"
+    # CASO: ANTICIPO / REGALO FATTO
+    if any(k in tokens_lower for k in ["anticip", "regalo per", "regalo di", "regalo a"]):
+        # Se non è un regalo esplicitamente 'ricevuto'
+        if not any(k in tokens_lower for k in ["ricevuto", "mi hanno regalato", "da nonna", "da mamma", "da papa"]):
+            # Lasciamo che Gemini NLP gestisca i nomi complessi multipli se ci sono virgole o 'a'
+            return None
+
+    # CASO: REGALO RICEVUTO
+    if any(k in tokens_lower for k in ["regalo ricevuto", "ricevuto regalo", "regalo compleanno", "regalo laurea"]):
         return {
-            "is_valid": True, "tipo_movimento": "HO_OFFERTO", "persona_coinvolta": persona,
-            "descrizione": desc, "importo": importo, "macro_categoria": "RISTORAZIONE",
-            "sotto_categoria": "Offerte Amici", "metodo_pagamento": metodo, "esercente": "Manuale"
+            "is_valid": True, "tipo_movimento": "ENTRATA", "persona_coinvolta": None,
+            "descrizione": "Regalo Ricevuto", "importo": importo, "macro_categoria": "ENTRATE",
+            "sotto_categoria": "Regali", "metodo_pagamento": metodo, "esercente": "Regalo"
         }
 
-    # 2. CASO: QUALCUNO OFFRE A ME
-    ricevuto_match = re.search(r'([a-zA-Zàèéìòù]+)\s+mi\s+(?:offre|ha offerto|ha pagato|paga|offerto|pagato)', tokens, re.I)
-    if "mi offre" in tokens_lower or "mi ha pagato" in tokens_lower or "mi paga" in tokens_lower or ricevuto_match:
-        persona = ricevuto_match.group(1).capitalize() if ricevuto_match else "Amico"
-        desc_clean = re.sub(r'[a-zA-Zàèéìòù]+\s+mi\s+(?:offre|ha offerto|ha pagato|paga|offerto|pagato)', '', tokens, flags=re.I).strip()
-        desc = desc_clean.capitalize() or "Ricevuto"
-        return {
-            "is_valid": True, "tipo_movimento": "MI_HA_OFFERTO", "persona_coinvolta": persona,
-            "descrizione": desc, "importo": importo, "macro_categoria": "RISTORAZIONE",
-            "sotto_categoria": "Ricevuti Amici", "metodo_pagamento": metodo, "esercente": "Manuale"
-        }
-
-    # 3. CASO: ENTRATE
+    # ENTRATE GENITOTI / STIPENDIO
     if any(k in tokens_lower for k in ["stipendio", "salario", "paga"]):
         return {
             "is_valid": True, "tipo_movimento": "ENTRATA", "persona_coinvolta": None,
@@ -233,14 +220,8 @@ def parse_local_text(text: str):
             "descrizione": "Soldi da Famiglia", "importo": importo, "macro_categoria": "ENTRATE",
             "sotto_categoria": "Famiglia", "metodo_pagamento": metodo, "esercente": "Genitori"
         }
-    if "regalo" in tokens_lower:
-        return {
-            "is_valid": True, "tipo_movimento": "ENTRATA", "persona_coinvolta": None,
-            "descrizione": "Regalo", "importo": importo, "macro_categoria": "ENTRATE",
-            "sotto_categoria": "Regali", "metodo_pagamento": metodo, "esercente": "Regalo"
-        }
 
-    # 4. CASO: USCITE NORMALI
+    # DEFAULT CATEGORIE COMUNI
     macro, sotto = "ALTRO", "Altro"
     desc = tokens.capitalize() or "Spesa"
 
@@ -248,18 +229,16 @@ def parse_local_text(text: str):
         macro, sotto = "FUMO", "Snus"
     elif any(k in tokens_lower for k in ["terea", "heets", "glo", "iqos"]):
         macro, sotto = "FUMO", "Terea"
-    elif any(k in tokens_lower for k in ["sigarett", "marlboro", "camel", "winston"]):
+    elif any(k in tokens_lower for k in ["sigarett", "marlboro", "camel"]):
         macro, sotto = "FUMO", "Sigarette"
-    elif any(k in tokens_lower for k in ["cartin", "filtr", "tabacco"]):
-        macro, sotto = "FUMO", "Tabacco e Accessori"
-    elif any(k in tokens_lower for k in ["gin", "tonic", "peroni", "birra", "vino", "spritz", "cocktail", "amaro"]):
+    elif any(k in tokens_lower for k in ["gin", "tonic", "birra", "vino", "spritz", "cocktail"]):
         macro, sotto = "RISTORAZIONE", "Bevande Alcoliche"
-    elif any(k in tokens_lower for k in ["caffe", "caffè", "cappuccino", "cornetto", "pizza", "pranzo", "cena", "ristorante"]):
+    elif any(k in tokens_lower for k in ["caffe", "caffè", "pizza", "pranzo", "cena"]):
         macro, sotto = "RISTORAZIONE", "Pasto / Bar"
-    elif any(k in tokens_lower for k in ["coca", "fanta", "acqua", "succo", "the", "tè"]):
-        macro, sotto = "RISTORAZIONE", "Bevande Analcoliche"
-    elif any(k in tokens_lower for k in ["benzina", "diesel", "gasolio", "rifornimento"]):
+    elif any(k in tokens_lower for k in ["benzina", "diesel", "gasolio"]):
         macro, sotto = "TRASPORTI", "Carburante"
+    else:
+        return None # Invia a Gemini se non è una keyword standard
 
     return {
         "is_valid": True, "tipo_movimento": "USCITA", "persona_coinvolta": None,
@@ -267,71 +246,104 @@ def parse_local_text(text: str):
         "sotto_categoria": sotto, "metodo_pagamento": metodo, "esercente": "Manuale"
     }
 
-# --- TASTIERA DI CONTROLLO CON USER_ID DINAMICO ---
-# --- TASTIERA DI CONTROLLO FISSA ---
+# --- TASTIERA PRINCIPALE (CON TASTO REGALI) ---
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📱 Apri Dashboard"), KeyboardButton(text="📊 Report Mese")],
-            [KeyboardButton(text="👥 Debiti & Amici"), KeyboardButton(text="🏷️ Spese per Categoria")],
-            [KeyboardButton(text="📋 Ultime Operazioni"), KeyboardButton(text="ℹ️ Guida Inserimento")]
+            [KeyboardButton(text="🎁 Regali & Collette"), KeyboardButton(text="👥 Debiti & Amici")],
+            [KeyboardButton(text="🏷️ Spese per Categoria"), KeyboardButton(text="ℹ️ Guida Inserimento")]
         ],
         resize_keyboard=True,
         persistent=True
     )
 
-# --- HANDLER BOTTONE DASHBOARD CON ID DINAMICO ---
+def get_inline_dashboard(user_id: int):
+    target_url = f"{WEBAPP_URL}/?user_id={user_id}"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🚀 Apri Dashboard Mini App", web_app=WebAppInfo(url=target_url))]
+        ]
+    )
+
+# --- BOTTONE APRI DASHBOARD ---
 @dp.message(Command("dashboard"))
 @dp.message(F.text == "📱 Apri Dashboard")
 async def btn_link_dashboard(message: Message):
     user_id = message.from_user.id
-    target_url = f"{WEBAPP_URL}/?user_id={user_id}"
-
-    inline_kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🚀 Apri Mini App", web_app=WebAppInfo(url=target_url))]
-        ]
+    await message.reply(
+        "📊 <b>Dashboard Finanziaria Personale</b>\n\nTocca qui sotto per aprire i grafici in tempo reale:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_inline_dashboard(user_id)
     )
 
-    testo = (
-        "📊 <b>Dashboard Finanziaria Personale</b>\n\n"
-        "Premi il pulsante qui sotto per avviare la Mini App con i tuoi dati:"
-    )
-    await message.reply(testo, parse_mode=ParseMode.HTML, reply_markup=inline_kb)
+# --- SEZIONE DEDICATA: REGALI & COLLETTE ---
+@dp.message(Command("regali"))
+@dp.message(F.text == "🎁 Regali & Collette")
+async def btn_regali(message: Message):
+    user_id = message.from_user.id
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT id, nome_regalo, destinatario, totale_anticipato, quota_singola, partecipanti_totali, partecipanti_pagati, completato
+                FROM collette_regali
+                WHERE user_id = %s
+                ORDER BY completato ASC, id DESC
+                LIMIT 10
+            """, (user_id,))
+            collette = cursor.fetchall()
+    finally:
+        release_db_connection(conn)
 
-# --- GUIDA INSERIMENTO ---
+    if not collette:
+        await message.reply(
+            "🎁 <b>Nessun regalo o colletta attiva al momento.</b>\n\n"
+            "Per registrare un anticipo scrivi ad esempio:\n"
+            "• <code>Anticipo 60 per regalo Marco a Luca, Simone, Giovanni</code>\n"
+            "• <code>Anticipo soldi regalo Alessio 40 carta</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_main_keyboard()
+        )
+        return
+
+    testo = "🎁 <b>Riepilogo Regali e Collette Anticipate:</b>\n\n"
+    for c_id, nome, dest, tot, quota, part_tot, part_pag, comp in collette:
+        tot_val = float(tot)
+        quota_val = float(quota)
+        dest_str = f" per <b>{dest}</b>" if dest else ""
+        stato_icon = "✅ <i>(Completato)</i>" if comp else "⏳ <i>(In corso)</i>"
+
+        testo += f"📦 <b>{html.escape(nome)}</b>{dest_str} - {stato_icon}\n"
+        testo += f"💰 <b>Totale Anticipato:</b> €{tot_val:.2f} (Quota singola: €{quota_val:.2f})\n"
+        testo += "👥 <b>Partecipanti:</b>\n"
+
+        for p in part_tot:
+            if p in part_pag:
+                testo += f"   • {html.escape(p)}: 🟢 <b>PAGATO (€{quota_val:.2f})</b>\n"
+            else:
+                testo += f"   • {html.escape(p)}: 🔴 <b>DEVE DARE €{quota_val:.2f}</b>\n"
+        testo += "\n"
+
+    testo += "💡 <i>Quando qualcuno ti restituisce la sua parte, scrivi semplicemente:</i>\n<code>Simone mi ha dato 20 per il regalo</code>"
+    await message.reply(testo, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
+
+# --- GUIDA AGGIORNATA ---
 @dp.message(Command("guida"))
 @dp.message(F.text == "ℹ️ Guida Inserimento")
 async def btn_guida(message: Message):
     testo = (
         "💡 <b>Guida Inserimenti Rapidi:</b>\n\n"
-        "📸 <b>Scontrini:</b> Invia la foto dello scontrino per estrarre tutti gli articoli.\n\n"
-        "🤝 <b>Offerte & Debiti tra Amici:</b>\n"
-        "• <i>Quando offri tu:</i> <code>caffe offerto a Simone 1.50 carta</code> oppure <code>Acqua offerta a Simone 1 Arcate</code>\n"
-        "• <i>Quando offrono a te:</i> <code>Simone mi offre birra 2.50</code> oppure <code>Marco mi ha pagato il pranzo 12</code>\n\n"
-        "🟢 <b>Entrate & Stipendio:</b>\n"
-        "• <code>Stipendio 1600 bonifico</code>\n"
-        "• <code>50 mamma contanti</code>\n"
-        "• <code>Regalo 100 papa</code>\n\n"
-        "🔴 <b>Spese Personali:</b>\n"
-        "• <code>snus 5 tabacchino</code>\n"
-        "• <code>Gin tonic 6 carta</code>\n"
-        "• <code>Benzina 40</code>"
-    )
-    await message.reply(testo, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
-
-# --- COMANDO /START ---
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    testo = (
-        f"👋 Ciao <b>{html.escape(message.from_user.full_name)}</b>!\n\n"
-        "💡 <b>Comandi e Funzioni:</b>\n"
-        "📱 Tocca <b>'Dashboard'</b> per i grafici interattivi.\n"
-        "📸 Invia foto di scontrini fiscali.\n"
-        "🤝 <b>Offerte ad amici:</b>\n"
+        "🎁 <b>Anticipo Regali Singoli o di Gruppo:</b>\n"
+        "• <code>Anticipo 60 regalo Marco a Luca, Simone, Giovanni</code> <i>(calcola in automatico 20€ a testa)</i>\n"
+        "• <code>Anticipo soldi regalo Alessio 40 carta</code>\n\n"
+        "💵 <b>Quando ti saldano la quota:</b>\n"
+        "• <code>Simone mi ha dato 20 per il regalo</code>\n\n"
+        "🤝 <b>Offerte tra Amici:</b>\n"
         "• <code>caffe offerto a Simone 1.50 carta</code>\n"
-        "• <code>Simone mi offre birra 2.50</code>\n"
-        "💸 <b>Spese e Accrediti:</b> <code>snus 5</code>, <code>Stipendio 1600</code>."
+        "• <code>Simone mi offre birra 2.50</code>\n\n"
+        "🟢 <b>Entrate:</b> <code>Stipendio 1600 bonifico</code>, <code>Regalo ricevuto 50 nonna</code>\n"
+        "🔴 <b>Spese Personali:</b> <code>snus 5 tabacchino</code>, <code>Benzina 40</code>"
     )
     await message.reply(testo, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
 
@@ -348,19 +360,19 @@ async def btn_report_mese(message: Message):
             cursor.execute("""
                 SELECT COALESCE(SUM(totale), 0.0), COUNT(id) 
                 FROM transazioni 
-                WHERE user_id = %s AND data_ora LIKE %s AND tipo_movimento = 'USCITA'
-            """, (user_id, f"{mese_corrente}%"))
+                WHERE user_id = %s AND (data_ora::text LIKE %s OR data_creazione::text LIKE %s) AND tipo_movimento = 'USCITA'
+            """, (user_id, f"{mese_corrente}%", f"{mese_corrente}%"))
             row_uscite = cursor.fetchone()
-            totale_uscite = float(row_uscite[0])
+            totale_uscite = float(row_uscite[0] or 0.0)
             num_uscite = row_uscite[1]
 
             cursor.execute("""
                 SELECT COALESCE(SUM(totale), 0.0), COUNT(id) 
                 FROM transazioni 
-                WHERE user_id = %s AND data_ora LIKE %s AND tipo_movimento = 'ENTRATA'
-            """, (user_id, f"{mese_corrente}%"))
+                WHERE user_id = %s AND (data_ora::text LIKE %s OR data_creazione::text LIKE %s) AND tipo_movimento = 'ENTRATA'
+            """, (user_id, f"{mese_corrente}%", f"{mese_corrente}%"))
             row_entrate = cursor.fetchone()
-            totale_entrate = float(row_entrate[0])
+            totale_entrate = float(row_entrate[0] or 0.0)
             num_entrate = row_entrate[1]
 
             saldo = totale_entrate - totale_uscite
@@ -369,10 +381,10 @@ async def btn_report_mese(message: Message):
                 SELECT v.macro_categoria, SUM(v.prezzo_totale)
                 FROM voci_spesa v
                 JOIN transazioni t ON v.transazione_id = t.id
-                WHERE t.user_id = %s AND t.data_ora LIKE %s AND t.tipo_movimento = 'USCITA'
+                WHERE t.user_id = %s AND (t.data_ora::text LIKE %s OR t.data_creazione::text LIKE %s) AND t.tipo_movimento = 'USCITA'
                 GROUP BY v.macro_categoria
                 ORDER BY SUM(v.prezzo_totale) DESC
-            """, (user_id, f"{mese_corrente}%"))
+            """, (user_id, f"{mese_corrente}%", f"{mese_corrente}%"))
             macro_uscite = cursor.fetchall()
     finally:
         release_db_connection(conn)
@@ -380,11 +392,7 @@ async def btn_report_mese(message: Message):
     testo = f"📊 <b>Bilancio Finanziario - {datetime.now().strftime('%m/%Y')}</b>\n\n"
     testo += f"🟢 <b>Entrate:</b> +€{totale_entrate:.2f} (<i>{num_entrate} accrediti</i>)\n"
     testo += f"🔴 <b>Uscite:</b> -€{totale_uscite:.2f} (<i>{num_uscite} spese</i>)\n"
-    
-    if saldo >= 0:
-        testo += f"💰 <b>Saldo Netto:</b> 🟢 <b>+€{saldo:.2f}</b> (<i>In attivo</i>)\n\n"
-    else:
-        testo += f"💰 <b>Saldo Netto:</b> 🔴 <b>-€{-saldo:.2f}</b> (<i>In disavanzo</i>)\n\n"
+    testo += f"💰 <b>Saldo Netto:</b> {'🟢 +€' if saldo >= 0 else '🔴 -€'}{abs(saldo):.2f}\n\n"
 
     testo += "📂 <b>Ripartizione Spese per Categoria:</b>\n"
     if not macro_uscite:
@@ -421,21 +429,21 @@ async def btn_amici(message: Message):
         await message.reply("Nessun debito o credito registrato con gli amici.", reply_markup=get_main_keyboard())
         return
 
-    testo = "👥 <b>Riepilogo Offerte e Saldi Amici:</b>\n\n"
+    testo = "👥 <b>Riepilogo Saldi Amici:</b>\n\n"
     for persona, crediti, debiti in rows:
         c = float(crediti or 0.0)
         d = float(debiti or 0.0)
         saldo = c - d
         if saldo > 0:
-            testo += f"• <b>{html.escape(persona)}:</b> 🟢 ti deve <b>€{saldo:.2f}</b> (Offerti: €{c:.2f})\n"
+            testo += f"• <b>{html.escape(persona)}:</b> 🟢 ti deve <b>€{saldo:.2f}</b>\n"
         elif saldo < 0:
-            testo += f"• <b>{html.escape(persona)}:</b> 🔴 gli devi dare <b>€{-saldo:.2f}</b> (Ricevuti: €{d:.2f})\n"
+            testo += f"• <b>{html.escape(persona)}:</b> 🔴 gli devi dare <b>€{-saldo:.2f}</b>\n"
         else:
-            testo += f"• <b>{html.escape(persona)}:</b> ⚪ siete in pari (€{c:.2f})\n"
+            testo += f"• <b>{html.escape(persona)}:</b> ⚪ siete in pari\n"
 
     await message.reply(testo, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
 
-# --- SPESE PER CATEGORIA ---
+# --- CATEGORIE ---
 @dp.message(Command("categorie"))
 @dp.message(F.text == "🏷️ Spese per Categoria")
 async def btn_spese_categoria(message: Message):
@@ -449,10 +457,10 @@ async def btn_spese_categoria(message: Message):
                 SELECT t.tipo_movimento, v.macro_categoria, COALESCE(v.sotto_categoria, 'Altro'), SUM(v.prezzo_totale)
                 FROM voci_spesa v
                 JOIN transazioni t ON v.transazione_id = t.id
-                WHERE t.user_id = %s AND t.data_ora LIKE %s
+                WHERE t.user_id = %s AND (t.data_ora::text LIKE %s OR t.data_creazione::text LIKE %s)
                 GROUP BY t.tipo_movimento, v.macro_categoria, v.sotto_categoria
                 ORDER BY t.tipo_movimento DESC, v.macro_categoria ASC, SUM(v.prezzo_totale) DESC
-            """, (user_id, f"{mese_corrente}%"))
+            """, (user_id, f"{mese_corrente}%", f"{mese_corrente}%"))
             righe = cursor.fetchall()
     finally:
         release_db_connection(conn)
@@ -461,9 +469,7 @@ async def btn_spese_categoria(message: Message):
         await message.reply("Nessun movimento registrato per questo mese.", reply_markup=get_main_keyboard())
         return
 
-    uscite_dict = {}
-    entrate_dict = {}
-
+    uscite_dict, entrate_dict = {}, {}
     for tipo, macro, sotto, tot in righe:
         target_dict = entrate_dict if tipo == "ENTRATA" else uscite_dict
         if macro not in target_dict:
@@ -487,51 +493,9 @@ async def btn_spese_categoria(message: Message):
                 testo += f"   └ <i>{html.escape(sotto)}:</i> €{importo:.2f}\n"
             testo += "\n"
 
-    if len(testo) > 4000:
-        testo = testo[:3950] + "\n\n<i>...altre voci salvate!</i>"
-
     await message.reply(testo, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
 
-# --- ULTIME OPERAZIONI ---
-@dp.message(Command("ultime"))
-@dp.message(F.text == "📋 Ultime Operazioni")
-async def btn_ultime_spese(message: Message):
-    user_id = message.from_user.id
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT id, data_ora, tipo_movimento, esercente, totale, metodo_pagamento, tipo_inserimento, note
-                FROM transazioni 
-                WHERE user_id = %s 
-                ORDER BY id DESC LIMIT 8
-            """, (user_id,))
-            transazioni = cursor.fetchall()
-    finally:
-        release_db_connection(conn)
-
-    if not transazioni:
-        await message.reply("Nessuna operazione registrata finora.", reply_markup=get_main_keyboard())
-        return
-
-    testo = "📋 <b>Ultime 8 Operazioni:</b>\n\n"
-    for t_id, data, tipo_mov, es, tot, metodo, tipo_ins, note in transazioni:
-        tot_val = float(tot)
-        if tipo_mov == "ENTRATA":
-            icona = "🟢 <b>[ENTRATA]</b>"
-            segno = "+"
-        else:
-            icona = "📸 <b>[SCONTRINO]</b>" if tipo_ins == "FOTO" else "🔴 <b>[USCITA]</b>"
-            segno = "-"
-
-        metodo_str = f" ({metodo})" if metodo != "NON_SPECIFICATO" else ""
-        nome_es = es if es and es != "Manuale" else (note or "Movimento")
-        testo += f"{icona} <b>{data}</b>\n"
-        testo += f"   🏷️ {html.escape(str(nome_es))}: <b>{segno}€{tot_val:.2f}</b>{metodo_str}\n\n"
-
-    await message.reply(testo, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
-
-# --- GESTIONE TESTO RAPIDO NLP ---
+# --- GESTORE NLP MESSAGGI TESTUALI ---
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_nlp_text(message: Message):
     testo_utente = message.text.strip()
@@ -549,15 +513,17 @@ async def handle_nlp_text(message: Message):
             dati = json.loads(response.text)
         except Exception as e:
             logging.error(f"Errore NLP Gemini: {e}")
-            await message.reply("❌ Errore durante l'analisi. Riprova con un formato semplice (es. <code>snus 5 tabacchino</code>).")
+            await message.reply("❌ Errore durante l'elaborazione. Riprova con un formato più chiaro.")
             return
 
     if not dati or not dati.get("is_valid", False) or float(dati.get("importo", 0.0)) <= 0:
-        await message.reply("❓ Non ho riconosciuto una transazione valida. Esempio: <code>caffe offerto a Simone 1.50 carta</code>", parse_mode=ParseMode.HTML)
+        await message.reply("❓ Non ho riconosciuto una spesa valida. Consulta la sezione ℹ️ Guida per esempi.", parse_mode=ParseMode.HTML)
         return
 
     tipo_mov = dati.get("tipo_movimento", "USCITA")
     persona = dati.get("persona_coinvolta")
+    partecipanti = [p.capitalize() for p in dati.get("partecipanti", []) if p]
+    destinatario = dati.get("destinatario_regalo")
     descrizione = dati.get("descrizione", "Movimento")
     importo = float(dati.get("importo", 0.0))
     macro_cat = dati.get("macro_categoria", "ALTRO")
@@ -570,79 +536,143 @@ async def handle_nlp_text(message: Message):
     try:
         with conn.cursor() as cursor:
 
-            def get_friend_net_balance(cur, uid, p_name):
-                cur.execute("""
-                    SELECT SUM(CASE WHEN tipo = 'HO_OFFERTO' THEN importo ELSE -importo END)
-                    FROM debiti_crediti
-                    WHERE user_id = %s AND persona = %s
-                """, (uid, p_name))
-                res = cur.fetchone()[0]
-                return float(res) if res is not None else 0.0
+            # -------------------------------------------------------------
+            # CASO 1: ANTICIPO REGALO O COLLETTA A PIÙ PERSONE
+            # -------------------------------------------------------------
+            if tipo_mov == "ANTICIPO_REGALO":
+                # Se non c'è una lista partecipanti ma c'è una persona/destinatario
+                if not partecipanti:
+                    nome_target = persona or destinatario or "Amico"
+                    partecipanti = [nome_target.capitalize()]
 
-            if tipo_mov == "HO_OFFERTO":
-                nome_p = persona or "Amico"
+                quota_singola = round(importo / len(partecipanti), 2)
+                nome_regalo = descrizione or f"Regalo {destinatario or 'Amico'}"
+
+                # 1. Registra l'USCITA totale monetaria
+                cursor.execute("""
+                    INSERT INTO transazioni (user_id, data_ora, tipo_movimento, tipo_inserimento, esercente, totale, metodo_pagamento, note)
+                    VALUES (%s, %s, 'USCITA', 'MANUALE', %s, %s, %s, %s)
+                    RETURNING id
+                """, (user_id, data_ora, esercente, importo, metodo, f"Anticipo {nome_regalo}"))
+                t_id = cursor.fetchone()[0]
+
+                cursor.execute("""
+                    INSERT INTO voci_spesa (transazione_id, nome, quantita, prezzo_unitario, prezzo_totale, macro_categoria, sotto_categoria)
+                    VALUES (%s, %s, 1.0, %s, %s, 'REGALI_COLLETTE', 'Regali Fatti / Anticipi')
+                """, (t_id, nome_regalo, importo, importo))
+
+                # 2. Crea la colletta nella tabella dedicata
+                cursor.execute("""
+                    INSERT INTO collette_regali (user_id, nome_regalo, destinatario, totale_anticipato, quota_singola, partecipanti_totali, partecipanti_pagati, data_ora)
+                    VALUES (%s, %s, %s, %s, %s, %s, '{}', %s)
+                """, (user_id, nome_regalo, destinatario, importo, quota_singola, partecipanti, data_ora))
+
+                # 3. Registra i debiti nei confronti dei partecipanti
+                for p in partecipanti:
+                    cursor.execute("""
+                        INSERT INTO debiti_crediti (user_id, persona, tipo, importo, descrizione, data_ora)
+                        VALUES (%s, %s, 'HO_OFFERTO', %s, %s, %s)
+                    """, (user_id, p, quota_singola, f"Quota {nome_regalo}", data_ora))
+
+                conn.commit()
+
+                elenco_part = "\n".join([f"   • <b>{p}</b>: ti deve <b>€{quota_singola:.2f}</b>" for p in partecipanti])
+                await message.reply(
+                    f"🎁 <b>Anticipo Regalo Registrato con Successo!</b>\n\n"
+                    f"💸 <b>Uscita registrata dal tuo conto:</b> -€{importo:.2f} ({metodo})\n"
+                    f"📦 <b>Regalo:</b> {html.escape(nome_regalo)}\n\n"
+                    f"👥 <b>Quote da riscuotere ({len(partecipanti)} partecipanti):</b>\n{elenco_part}\n\n"
+                    f"<i>Tutti i saldi sono stati aggiunti alla sezione '🎁 Regali & Collette'.</i>",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+
+            # -------------------------------------------------------------
+            # CASO 2: QUALCUNO HA SALDATO LA PROPRIA QUOTA DEL REGALO
+            # -------------------------------------------------------------
+            elif tipo_mov == "SALDO_RICEVUTO":
+                nome_p = persona.capitalize() if persona else "Amico"
+
+                # 1. Registra l'entrata monetaria effettiva
+                cursor.execute("""
+                    INSERT INTO transazioni (user_id, data_ora, tipo_movimento, tipo_inserimento, esercente, totale, metodo_pagamento, note)
+                    VALUES (%s, %s, 'ENTRATA', 'MANUALE', 'Rimborso', %s, %s, %s)
+                    RETURNING id
+                """, (user_id, data_ora, importo, metodo, f"Rimborso ricevuto da {nome_p}"))
+                t_id = cursor.fetchone()[0]
+
+                cursor.execute("""
+                    INSERT INTO voci_spesa (transazione_id, nome, quantita, prezzo_unitario, prezzo_totale, macro_categoria, sotto_categoria)
+                    VALUES (%s, %s, 1.0, %s, %s, 'ENTRATE', 'Rimborsi Regali')
+                """, (t_id, f"Rimborso da {nome_p}", importo, importo))
+
+                # 2. Pareggia il debito nel modulo amici
+                cursor.execute("""
+                    INSERT INTO debiti_crediti (user_id, persona, tipo, importo, descrizione, data_ora)
+                    VALUES (%s, %s, 'MI_HA_OFFERTO', %s, %s, %s)
+                """, (user_id, nome_p, importo, "Rimborso quota", data_ora))
+
+                # 3. Aggiorna lo stato nella colletta aperta
+                cursor.execute("""
+                    UPDATE collette_regali
+                    SET partecipanti_pagati = array_append(partecipanti_pagati, %s)
+                    WHERE user_id = %s 
+                      AND %s = ANY(partecipanti_totali)
+                      AND NOT (%s = ANY(partecipanti_pagati))
+                      AND completato = FALSE
+                """, (nome_p, user_id, nome_p, nome_p))
+
+                # Verifica se la colletta è ora completata
+                cursor.execute("""
+                    UPDATE collette_regali
+                    SET completato = TRUE
+                    WHERE user_id = %s 
+                      AND array_length(partecipanti_totali, 1) = array_length(partecipanti_pagati, 1)
+                """, (user_id,))
+
+                conn.commit()
+
+                await message.reply(
+                    f"✅ <b>Saldo Quota Registrato!</b>\n"
+                    f"👤 <b>Da:</b> {html.escape(nome_p)}\n"
+                    f"🟢 <b>Importo Accreditato:</b> +€{importo:.2f}\n\n"
+                    f"<i>Il debito con {html.escape(nome_p)} è stato scalato e la colletta aggiornata!</i>",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+
+            # -------------------------------------------------------------
+            # CASO 3: OFFERTE CLASSICHE TRA AMICI
+            # -------------------------------------------------------------
+            elif tipo_mov == "HO_OFFERTO":
+                nome_p = (persona or "Amico").capitalize()
                 cursor.execute("""
                     INSERT INTO transazioni (user_id, data_ora, tipo_movimento, tipo_inserimento, esercente, totale, metodo_pagamento, note)
                     VALUES (%s, %s, 'USCITA', 'MANUALE', %s, %s, %s, %s)
                     RETURNING id
                 """, (user_id, data_ora, esercente, importo, metodo, f"Offerto a {nome_p}: {descrizione}"))
                 t_id = cursor.fetchone()[0]
-                
+
                 cursor.execute("""
                     INSERT INTO voci_spesa (transazione_id, nome, quantita, prezzo_unitario, prezzo_totale, macro_categoria, sotto_categoria)
                     VALUES (%s, %s, 1.0, %s, %s, %s, %s)
                 """, (t_id, f"{descrizione} (offerto a {nome_p})", importo, importo, macro_cat, sotto_cat))
-                
+
                 cursor.execute("""
                     INSERT INTO debiti_crediti (user_id, persona, tipo, importo, descrizione, data_ora)
                     VALUES (%s, %s, 'HO_OFFERTO', %s, %s, %s)
                 """, (user_id, nome_p, importo, descrizione, data_ora))
                 conn.commit()
 
-                saldo_att = get_friend_net_balance(cursor, user_id, nome_p)
-                if saldo_att > 0:
-                    saldo_str = f"🟢 <b>{html.escape(nome_p)} ti deve in totale €{saldo_att:.2f}</b>"
-                elif saldo_att < 0:
-                    saldo_str = f"🔴 <b>Devi ancora dare a {html.escape(nome_p)} €{-saldo_att:.2f}</b>"
-                else:
-                    saldo_str = f"⚪ <b>Sei perfettamente in pari con {html.escape(nome_p)}!</b>"
-
                 await message.reply(
-                    f"🤝 <b>Offerta registrata!</b>\n"
-                    f"👤 <b>A chi:</b> {html.escape(nome_p)}\n"
-                    f"☕ <b>Cosa:</b> {html.escape(descrizione)}\n"
-                    f"💰 <b>Importo:</b> €{importo:.2f} (<i>{metodo}</i>)\n\n"
-                    f"📊 <b>Saldo aggiornato:</b>\n{saldo_str}",
+                    f"🤝 <b>Offerta registrata!</b>\n👤 <b>A chi:</b> {html.escape(nome_p)}\n☕ <b>Cosa:</b> {html.escape(descrizione)}\n💰 <b>Importo:</b> €{importo:.2f} ({metodo})",
                     parse_mode=ParseMode.HTML
                 )
                 return
 
-            elif tipo_mov == "MI_HA_OFFERTO":
-                nome_p = persona or "Amico"
-                cursor.execute("""
-                    INSERT INTO debiti_crediti (user_id, persona, tipo, importo, descrizione, data_ora)
-                    VALUES (%s, %s, 'MI_HA_OFFERTO', %s, %s, %s)
-                """, (user_id, nome_p, importo, descrizione, data_ora))
-                conn.commit()
-
-                saldo_att = get_friend_net_balance(cursor, user_id, nome_p)
-                if saldo_att > 0:
-                    saldo_str = f"🟢 <b>{html.escape(nome_p)} ti deve ancora €{saldo_att:.2f}</b>"
-                elif saldo_att < 0:
-                    saldo_str = f"🔴 <b>Devi dare a {html.escape(nome_p)} in totale €{-saldo_att:.2f}</b>"
-                else:
-                    saldo_str = f"⚪ <b>Sei perfettamente in pari con {html.escape(nome_p)}!</b>"
-
-                await message.reply(
-                    f"🤝 <b>Debito annotato!</b>\n"
-                    f"👤 <b>Da chi:</b> {html.escape(nome_p)}\n"
-                    f"🍺 <b>Cosa ti ha offerto:</b> {html.escape(descrizione)}\n"
-                    f"💰 <b>Valore:</b> €{importo:.2f}\n\n"
-                    f"📊 <b>Saldo aggiornato:</b>\n{saldo_str}",
-                    parse_mode=ParseMode.HTML
-                )
-                return
-
+            # -------------------------------------------------------------
+            # CASO 4: ENTRATE O SPESE NORMALI
+            # -------------------------------------------------------------
             cursor.execute("""
                 INSERT INTO transazioni (user_id, data_ora, tipo_movimento, tipo_inserimento, esercente, totale, metodo_pagamento, note)
                 VALUES (%s, %s, %s, 'MANUALE', %s, %s, %s, %s)
@@ -660,14 +690,11 @@ async def handle_nlp_text(message: Message):
 
     icona = "🟢 <b>Entrata registrata!</b>" if tipo_mov == "ENTRATA" else "🔴 <b>Spesa registrata!</b>"
     await message.reply(
-        f"{icona}\n"
-        f"📝 <b>Articolo:</b> {html.escape(descrizione)}\n"
-        f"💰 <b>Importo:</b> €{importo:.2f} ({metodo})\n"
-        f"🏷️ <b>Categoria:</b> {macro_cat} ➔ <i>{html.escape(sotto_cat)}</i>",
+        f"{icona}\n📝 <b>Articolo:</b> {html.escape(descrizione)}\n💰 <b>Importo:</b> €{importo:.2f} ({metodo})\n🏷️ <b>Categoria:</b> {macro_cat} ➔ <i>{html.escape(sotto_cat)}</i>",
         parse_mode=ParseMode.HTML
     )
 
-# --- GESTIONE FOTO SCONTRINI ---
+# --- FOTO SCONTRINI ---
 @dp.message(F.photo)
 async def handle_receipt(message: Message):
     status_msg = await message.reply("⏳ <i>Analisi scontrino con Gemini 3.6 Flash...</i>", parse_mode=ParseMode.HTML)
@@ -732,7 +759,7 @@ async def handle_receipt(message: Message):
         logging.error(f"Errore scontrino: {e}")
         await status_msg.edit_text("❌ Errore lettura scontrino.")
 
-# --- ENDPOINTS API PER LA TELEGRAM WEBAPP ---
+# --- API ENDPOINTS ---
 async def web_index(request):
     with open("templates/index.html", "r", encoding="utf-8") as f:
         return web.Response(text=f.read(), content_type="text/html")
@@ -819,15 +846,12 @@ async def api_data(request):
         "friends": friends
     })
 
-# --- TASK ANTI-SLEEP IN BACKGROUND (SELF-PING OGNI 10 MINUTI) ---
+# --- TASK ANTI-SLEEP ---
 async def self_ping_task():
-    await asyncio.sleep(30) # Attende che il server sia completamente avviato
+    await asyncio.sleep(30)
     if not WEBAPP_URL.startswith("https://"):
-        return # Non esegue il ping se si trova in ambiente locale http://
-
+        return
     ping_url = f"{WEBAPP_URL}/health"
-    logging.info(f"🔄 Task Anti-Sleep avviato: ping attivo su {ping_url}")
-
     async with aiohttp.ClientSession() as session:
         while True:
             try:
@@ -835,23 +859,20 @@ async def self_ping_task():
                     if resp.status == 200:
                         logging.info("💓 Anti-Sleep Self-Ping inviato con successo (200 OK).")
             except Exception as e:
-                logging.warning(f"⚠️ Errore durante Self-Ping: {e}")
-            
-            await asyncio.sleep(600) # Ripete ogni 10 minuti esatti (600 secondi)
+                logging.warning(f"⚠️ Errore Self-Ping: {e}")
+            await asyncio.sleep(600)
 
-# --- AVVIO CONGIUNTO BOT + WEB SERVER ---
+# --- AVVIO SERVER ---
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
 
     app = web.Application()
     cors = aiohttp_cors.setup(app, defaults={"*": aiohttp_cors.ResourceOptions(allow_credentials=True, expose_headers="*", allow_headers="*")})
     
-    # Routing Pagine e Statici
     app.router.add_get("/", web_index)
     app.router.add_get("/health", web_health)
     app.router.add_static("/static/", path="static", name="static")
 
-    # Routing API con CORS
     resource = cors.add(app.router.add_resource("/api/data"))
     cors.add(resource.add_route("GET", api_data))
 
@@ -864,7 +885,7 @@ async def main():
 
     asyncio.create_task(self_ping_task())
 
-    print("🚀 Bot Finanze Personali sincronizzato e operativo!")
+    print("🚀 Bot Finanze Personali (Modulo Regali & Collette) Sincronizzato!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
