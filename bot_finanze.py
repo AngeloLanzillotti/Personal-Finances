@@ -22,6 +22,8 @@ from aiogram.filters import Command
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import pytz
 
 load_dotenv()
 
@@ -855,6 +857,62 @@ async def self_ping_task():
                 logging.warning(f"⚠️ Errore Self-Ping: {e}")
             await asyncio.sleep(600)
 
+async def send_daily_summary():
+    # Se il bot è privato usa l'ID in whitelist, altrimenti recupera tutti gli utenti unici
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            if ALLOWED_USER_ID:
+                users = [ALLOWED_USER_ID]
+            else:
+                cursor.execute("SELECT DISTINCT user_id FROM transazioni")
+                users = [r[0] for r in cursor.fetchall()]
+
+            tz = pytz.timezone("Europe/Rome")
+            oggi_str = datetime.now(tz).strftime("%Y-%m-%d")
+
+            for uid in users:
+                # 1. Recupera le uscite registrate oggi
+                cursor.execute("""
+                    SELECT t.tipo_movimento, t.totale, t.metodo_pagamento, t.note, t.tipo_inserimento, t.esercente
+                    FROM transazioni t
+                    WHERE t.user_id = %s 
+                      AND (t.data_ora::text LIKE %s OR t.data_creazione::text LIKE %s)
+                    ORDER BY t.id ASC
+                """, (uid, f"{oggi_str}%", f"{oggi_str}%"))
+                movimenti = cursor.fetchall()
+
+                if not movimenti:
+                    testo_notifica = (
+                        f"🌙 <b>Resoconto del Giorno ({datetime.now(tz).strftime('%d/%m/%Y')}):</b>\n\n"
+                        "✨ Oggi <b>nessuna spesa registrata</b>... o ti sei dimenticato di inserirle? 🤔"
+                    )
+                else:
+                    tot_uscite = sum(float(m[1]) for m in movimenti if m[0] == 'USCITA')
+                    tot_entrate = sum(float(m[1]) for m in movimenti if m[0] == 'ENTRATA')
+
+                    testo_notifica = f"🌙 <b>Resoconto Serale ({datetime.now(tz).strftime('%d/%m/%Y')}):</b>\n\n"
+                    testo_notifica += "📋 <b>Movimenti di oggi:</b>\n"
+                    
+                    for tipo_mov, tot, metodo, note, tipo_ins, esercente in movimenti:
+                        segno = "🔴 -" if tipo_mov == 'USCITA' else "🟢 +"
+                        nome_voce = note or esercente or "Movimento"
+                        metodo_str = f" <i>({metodo})</i>" if metodo != "NON_SPECIFICATO" else ""
+                        icona_tipo = "📸 " if tipo_ins == "FOTO" else "🏷️ "
+                        testo_notifica += f"• {icona_tipo}{html.escape(str(nome_voce))}: {segno}€{float(tot):.2f}{metodo_str}\n"
+
+                    testo_notifica += f"\n🔴 <b>Totale Uscite oggi:</b> €{tot_uscite:.2f}\n"
+                    if tot_entrate > 0:
+                        testo_notifica += f"🟢 <b>Totale Entrate oggi:</b> €{tot_entrate:.2f}\n"
+
+                try:
+                    await bot.send_message(chat_id=uid, text=testo_notifica, parse_mode=ParseMode.HTML)
+                    logging.info(f"Notifica serale 23:50 inviata a user_id: {uid}")
+                except Exception as e:
+                    logging.warning(f"Impossibile inviare notifica serale a {uid}: {e}")
+    finally:
+        release_db_connection(conn)
+
 # --- AVVIO SERVER ---
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
@@ -878,6 +936,12 @@ async def main():
 
     asyncio.create_task(self_ping_task())
 
+    # Configurazione Scheduler Giornaliero alle 23:50
+    scheduler = AsyncIOScheduler(timezone=pytz.timezone("Europe/Rome"))
+    scheduler.add_job(send_daily_summary, "cron", hour=23, minute=50)
+    scheduler.start()
+    logging.info("⏰ Scheduler Resoconto Serale attivo (Ogni giorno alle 23:50 Europe/Rome)")
+    
     print("🚀 Bot Finanze Personali Sincronizzato!")
     await dp.start_polling(bot)
 

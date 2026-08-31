@@ -4,3 +4,5 @@ python-dotenv
 aiohttp
 aiohttp-cors
 psycopg2-binary
+apscheduler
+pytz
