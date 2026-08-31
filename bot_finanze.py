@@ -18,7 +18,7 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo, CallbackQuery
 )
 from aiogram.enums import ParseMode
-from aiogram.filters import Command
+from aiogram.filters import Command, BaseMiddleware
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -41,6 +41,19 @@ logging.basicConfig(level=logging.INFO)
 
 # --- CONNECTION POOLING ---
 db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DATABASE_URL)
+
+# 1. Definisci il guardiano
+class WhitelistMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        allowed_id = int(os.getenv("ALLOWED_TELEGRAM_USER_ID", 0))
+        # Se l'utente non è autorizzato, lo blocca subito
+        if allowed_id and event.from_user.id != allowed_id:
+            await event.answer("⛔ Accesso negato: Questo bot è privato.")
+            return
+        return await handler(event, data)
+
+# 2. Lo registri UNA SOLA VOLTA sul Dispatcher
+dp.message.middleware(WhitelistMiddleware())
 
 def get_db_connection():
     return db_pool.getconn()
@@ -792,7 +805,7 @@ async def api_data(request):
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            # ENTRATE
+            # 1. ENTRATE MESE CORRENTE
             cursor.execute("""
                 SELECT COALESCE(SUM(totale), 0.0) 
                 FROM transazioni 
@@ -802,7 +815,7 @@ async def api_data(request):
             """, (user_id, f"{mese_corrente}%", f"{mese_corrente}%"))
             inc = float(cursor.fetchone()[0] or 0.0)
 
-            # USCITE
+            # 2. USCITE MESE CORRENTE
             cursor.execute("""
                 SELECT COALESCE(SUM(totale), 0.0) 
                 FROM transazioni 
@@ -812,7 +825,7 @@ async def api_data(request):
             """, (user_id, f"{mese_corrente}%", f"{mese_corrente}%"))
             exp = float(cursor.fetchone()[0] or 0.0)
 
-            # MACRO-CATEGORIE
+            # 3. MACRO-CATEGORIE MESE CORRENTE
             cursor.execute("""
                 SELECT v.macro_categoria, SUM(v.prezzo_totale)
                 FROM voci_spesa v 
@@ -825,7 +838,7 @@ async def api_data(request):
             """, (user_id, f"{mese_corrente}%", f"{mese_corrente}%"))
             cats = [{"name": r[0], "value": float(r[1])} for r in cursor.fetchall()]
 
-            # DEBITI / CREDITI AMICI
+            # 4. DEBITI / CREDITI AMICI
             cursor.execute("""
                 SELECT persona,
                        SUM(CASE WHEN tipo = 'HO_OFFERTO' THEN importo ELSE -importo END) AS saldo
@@ -834,6 +847,24 @@ async def api_data(request):
                 GROUP BY persona
             """, (user_id,))
             friends = [{"name": r[0], "balance": float(r[1] or 0.0)} for r in cursor.fetchall()]
+
+            # 5. STORICO ULTIMI 26 MESI (BILANCIO NETTO MENSILE)
+            cursor.execute("""
+                SELECT 
+                    SUBSTRING(COALESCE(NULLIF(data_ora, ''), data_creazione::text) FROM 1 FOR 7) AS mese,
+                    SUM(CASE WHEN tipo_movimento = 'ENTRATA' THEN totale ELSE 0 END) -
+                    SUM(CASE WHEN tipo_movimento = 'USCITA' THEN totale ELSE 0 END) AS netto
+                FROM transazioni
+                WHERE user_id = %s
+                GROUP BY mese
+                ORDER BY mese DESC
+                LIMIT 26
+            """, (user_id,))
+            history_rows = cursor.fetchall()
+            
+            # Ordina dal mese più vecchio al più recente per il grafico a linee
+            history = [{"month": r[0], "net": float(r[1] or 0.0)} for r in reversed(history_rows) if r[0]]
+
     finally:
         release_db_connection(conn)
 
@@ -843,7 +874,8 @@ async def api_data(request):
         "expense": exp,
         "balance": inc - exp,
         "categories": cats,
-        "friends": friends
+        "friends": friends,
+        "history": history
     })
 
 # --- TASK ANTI-SLEEP ---

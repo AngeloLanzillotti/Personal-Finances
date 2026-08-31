@@ -5,6 +5,7 @@ if (tg) {
 }
 
 var chartInstance = null;
+var trendChartInstance = null;
 
 function getUserId() {
     var urlParams = new URLSearchParams(window.location.search);
@@ -43,7 +44,84 @@ async function loadData(manual) {
         balanceEl.innerText = (balance >= 0 ? '+' : '') + '€' + balance.toFixed(2);
         balanceEl.className = 'text-sm font-bold ' + (balance >= 0 ? 'text-emerald-400' : 'text-rose-400');
 
-        // Render Grafico
+        // 1. RENDER GRAFICO ANDAMENTO STORICO 26 MESI (LINE CHART)
+        var trendCtx = document.getElementById('trendChart').getContext('2d');
+        var noTrendData = document.getElementById('noTrendDataText');
+
+        if (!data.history || data.history.length === 0) {
+            noTrendData.classList.remove('hidden');
+            if (trendChartInstance) {
+                trendChartInstance.destroy();
+                trendChartInstance = null;
+            }
+        } else {
+            noTrendData.classList.add('hidden');
+            if (trendChartInstance) {
+                trendChartInstance.destroy();
+            }
+
+            var labels = data.history.map(function(h) {
+                // Formatta "2026-08" in "08/26"
+                var parts = h.month.split('-');
+                return parts.length === 2 ? parts[1] + '/' + parts[0].slice(2) : h.month;
+            });
+            var values = data.history.map(function(h) { return h.net; });
+
+            // Colori dinamici dei punti (Verde per attivo, Rosso per disavanzo)
+            var pointColors = values.map(function(v) { return v >= 0 ? '#10b981' : '#f43f5e'; });
+
+            trendChartInstance = new Chart(trendCtx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Bilancio Netto (€)',
+                        data: values,
+                        borderColor: '#6366f1',
+                        borderWidth: 2.5,
+                        backgroundColor: 'rgba(99, 102, 241, 0.15)',
+                        fill: true,
+                        tension: 0.35,
+                        pointBackgroundColor: pointColors,
+                        pointBorderColor: '#0f172a',
+                        pointBorderWidth: 2,
+                        pointRadius: 4,
+                        pointHoverRadius: 6
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: {
+                            grid: { color: '#334155' },
+                            ticks: { color: '#94a3b8', font: { size: 10 } }
+                        },
+                        y: {
+                            grid: { color: '#334155' },
+                            ticks: {
+                                color: '#94a3b8',
+                                font: { size: 10 },
+                                callback: function(val) { return '€' + val; }
+                            }
+                        }
+                    },
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    var val = context.parsed.y;
+                                    return (val >= 0 ? 'Guadagno: +€' : 'Perdita: -€') + Math.abs(val).toFixed(2);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // 2. RENDER GRAFICO CATEGORIE (DOUGHNUT CHART)
         var ctx = document.getElementById('expenseChart').getContext('2d');
         var noData = document.getElementById('noDataText');
 
@@ -84,7 +162,7 @@ async function loadData(manual) {
             });
         }
 
-        // Render Saldi Amici
+        // 3. RENDER SALDI AMICI
         var fContainer = document.getElementById('friendsBalances');
         if (!data.friends || data.friends.length === 0) {
             fContainer.innerHTML = '<p class="text-slate-500">Nessun debito o credito aperto.</p>';
