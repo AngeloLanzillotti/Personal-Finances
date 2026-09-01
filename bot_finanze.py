@@ -140,7 +140,7 @@ def init_db():
 
 init_db()
 
-# --- PROMPT AI CON CLASSIFICAZIONE REGALI PERFETTA ---
+# --- PROMPT AI ---
 NLP_EXPENSE_PROMPT = """
 Analizza il messaggio contabile e restituisci ESCLUSIVAMENTE un JSON valido:
 {
@@ -180,6 +180,36 @@ Sei un assistente per l'estrazione dati da scontrini. Restituisci ESCLUSIVAMENTE
 }
 """
 
+# --- GESTORE AI CON RETRY E FALLBACK AUTOMATICO ---
+async def generate_gemini_content(contents, schema=True):
+    models_to_try = ['gemini-3.6-flash', 'gemini-2.5-flash']
+    config = types.GenerateContentConfig(response_mime_type="application/json") if schema else None
+
+    for model_name in models_to_try:
+        for attempt in range(2):
+            try:
+                loop = asyncio.get_running_loop()
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: ai_client.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=config
+                    )
+                )
+                if response and response.text:
+                    return response.text
+            except Exception as e:
+                err_str = str(e)
+                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
+                    logging.warning(f"⚠️ Modello {model_name} occupato (tentativo {attempt+1}). Ritento...")
+                    await asyncio.sleep(1.5)
+                else:
+                    logging.error(f"Errore chiamata Gemini su {model_name}: {e}")
+                    break
+
+    raise RuntimeError("I server AI sono momentaneamente saturi. Riprova tra poco.")
+
 def parse_local_text(text: str):
     text_clean = text.strip()
     match_num = re.search(r'(\d+[\.,]?\d*)', text_clean)
@@ -206,11 +236,9 @@ def parse_local_text(text: str):
 
     tokens_lower = tokens.lower()
 
-    # Se ci sono parole legate a regali/anticipi/offerte, delega sempre a Gemini per non sbagliare logica
     if any(k in tokens_lower for k in ["regalo", "anticip", "offert", "offro", "pagato a", "mi offre", "mi ha dato"]):
         return None
 
-    # Entrate fisse
     if any(k in tokens_lower for k in ["stipendio", "salario", "paga"]):
         return {
             "is_valid": True, "tipo_movimento": "ENTRATA", "persona_coinvolta": None,
@@ -509,15 +537,14 @@ async def handle_nlp_text(message: Message):
 
     if not dati or not dati.get("is_valid", False):
         try:
-            response = ai_client.models.generate_content(
-                model='gemini-3.6-flash',
+            response_text = await generate_gemini_content(
                 contents=[testo_utente, NLP_EXPENSE_PROMPT],
-                config=types.GenerateContentConfig(response_mime_type="application/json")
+                schema=True
             )
-            dati = json.loads(response.text)
+            dati = json.loads(response_text)
         except Exception as e:
             logging.error(f"Errore NLP Gemini: {e}")
-            await message.reply("❌ Errore durante l'elaborazione. Riprova con un formato più chiaro.")
+            await message.reply("⏳ I server AI sono momentaneamente saturi. Riprova tra qualche istante.")
             return
 
     if not dati or not dati.get("is_valid", False) or float(dati.get("importo", 0.0)) <= 0:
@@ -679,7 +706,7 @@ async def handle_nlp_text(message: Message):
 # --- SCONTRINI ---
 @dp.message(F.photo)
 async def handle_receipt(message: Message):
-    status_msg = await message.reply("⏳ <i>Analisi scontrino con Gemini 3.6 Flash...</i>", parse_mode=ParseMode.HTML)
+    status_msg = await message.reply("⏳ <i>Analisi scontrino con Gemini AI...</i>", parse_mode=ParseMode.HTML)
     user_id = message.from_user.id
     try:
         photo = message.photo[-1]
@@ -700,12 +727,11 @@ async def handle_receipt(message: Message):
             await status_msg.edit_text(f"⚠️ Scontrino già registrato il {dup[1]}.", parse_mode=ParseMode.HTML)
             return
 
-        response = ai_client.models.generate_content(
-            model='gemini-3.6-flash',
+        response_text = await generate_gemini_content(
             contents=[types.Part.from_bytes(data=image_data, mime_type='image/jpeg'), RECEIPT_PROMPT],
-            config=types.GenerateContentConfig(response_mime_type="application/json")
+            schema=True
         )
-        dati = json.loads(response.text)
+        dati = json.loads(response_text)
         if not dati.get("is_receipt", False):
             await status_msg.edit_text("⚠️ Nessuno scontrino valido rilevato.", parse_mode=ParseMode.HTML)
             return
@@ -858,7 +884,6 @@ async def self_ping_task():
             await asyncio.sleep(600)
 
 async def send_daily_summary():
-    # Se il bot è privato usa l'ID in whitelist, altrimenti recupera tutti gli utenti unici
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
@@ -872,7 +897,6 @@ async def send_daily_summary():
             oggi_str = datetime.now(tz).strftime("%Y-%m-%d")
 
             for uid in users:
-                # 1. Recupera le uscite registrate oggi
                 cursor.execute("""
                     SELECT t.tipo_movimento, t.totale, t.metodo_pagamento, t.note, t.tipo_inserimento, t.esercente
                     FROM transazioni t
@@ -936,7 +960,7 @@ async def main():
 
     asyncio.create_task(self_ping_task())
 
-    # Configurazione Scheduler Giornaliero alle 23:50
+    # Scheduler Giornaliero alle 23:50
     scheduler = AsyncIOScheduler(timezone=pytz.timezone("Europe/Rome"))
     scheduler.add_job(send_daily_summary, "cron", hour=23, minute=50)
     scheduler.start()
