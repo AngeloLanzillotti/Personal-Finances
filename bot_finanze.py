@@ -146,10 +146,10 @@ Analizza il messaggio contabile e restituisci ESCLUSIVAMENTE un JSON valido:
 {
   "is_valid": boolean,
   "tipo_movimento": "USCITA" | "ENTRATA" | "HO_OFFERTO" | "MI_HA_OFFERTO" | "ANTICIPO_COLLETTA" | "SALDO_RICEVUTO",
-  "persona_coinvolta": "Nome singolo (es. Alessio) o null",
+  "persona_coinvolta": "Nome singolo o 'Amici' o null",
   "partecipanti": ["Nome1", "Nome2"],
   "destinatario_regalo": "A chi è destinato il regalo o null",
-  "descrizione": "Descrizione sintetica del movimento",
+  "descrizione": "Descrizione sintetica del bene/servizio (es. Gelato, Birra, Caffè)",
   "importo": float,
   "macro_categoria": "ENTRATE" | "REGALI" | "FUMO" | "ALIMENTARI" | "RISTORAZIONE" | "CASA_PULIZIA" | "SALUTE_CURA" | "SVAGO_CULTURA" | "TECNOLOGIA" | "ABBIGLIAMENTO" | "TRASPORTI" | "ALTRO",
   "sotto_categoria": "Sotto-categoria precisa",
@@ -157,16 +157,23 @@ Analizza il messaggio contabile e restituisci ESCLUSIVAMENTE un JSON valido:
   "esercente": "Nome negozio/fonte o 'Manuale'"
 }
 
-Regole fondamentali di classificazione dei regali:
-1. REGALO RICEVUTO: (es. 'Alessio mi ha fatto un regalo di 50', 'Regalo ricevuto 100 nonna', 'Regalo per il mio compleanno')
-   -> tipo_movimento = "ENTRATA", macro_categoria = "ENTRATE", sotto_categoria = "Regali Ricevuti"
-2. REGALO FATTO DA SOLO (Nessuna colletta/anticipo): (es. 'Regalo per Alessio 40', 'Comprato regalo di laurea ad Alessio 50', 'Fatto regalo ad Alessio 30')
-   -> tipo_movimento = "USCITA", macro_categoria = "REGALI", sotto_categoria = "Regali Fatti", partecipanti = []
-3. ANTICIPO / COLLETTA DI GRUPPO: (es. 'Anticipo 60 per regalo Marco a Luca, Simone', 'Ho anticipato 40 per regalo Alessio a Marco')
-   -> SOLO se la frase contiene esplicitamente 'Anticipo'/'Ho anticipato' oppure cita altri partecipanti da cui riscuotere soldi.
-   -> tipo_movimento = "ANTICIPO_COLLETTA", macro_categoria = "REGALI", partecipanti = [elenco di chi deve ridare i soldi].
-4. SALDO QUOTA RICEVUTO: (es. 'Marco mi ha dato 20 per il regalo', 'Simone mi ha ridato i soldi')
-   -> tipo_movimento = "SALDO_RICEVUTO".
+Regole fondamentali di classificazione:
+1. MI HANNO OFFERTO / HANNO PAGATO PER ME (L'utente riceve l'offerta da altri):
+   - Frasi tipo: 'Ieri mi hanno offerto un gelato da 3', 'Marco mi offre una birra 4', 'Gelato 3 offerto da Simone', 'Mi ha pagato la pizza Luca 12'.
+   - tipo_movimento = "MI_HA_OFFERTO"
+   - persona_coinvolta = Nome dell'amico (es. Marco, Simone) o 'Amici' se generico.
+   - NOTA: Questa NON è una spesa/uscita dell'utente! È un debito/favore verso l'amico.
+
+2. HO OFFERTO IO (L'utente paga per altri):
+   - Frasi tipo: 'Ho offerto un caffe a Simone 1.50', 'Offro gelato a Marco 3', 'Birra offerta ad Alessio 5'.
+   - tipo_movimento = "HO_OFFERTO"
+   - persona_coinvolta = Nome della persona a cui l'utente ha offerto.
+   - NOTA: Questa È un'uscita dal portafoglio dell'utente e genera un credito verso l'amico.
+
+3. REGALI:
+   - Ricevuto: 'Alessio mi ha regalato 50' -> ENTRATA
+   - Fatto da solo: 'Regalo per Alessio 30' -> USCITA
+   - Anticipo colletta: 'Anticipo 60 regalo a Luca, Simone' -> ANTICIPO_COLLETTA
 """
 
 RECEIPT_PROMPT = """
@@ -548,7 +555,7 @@ async def handle_nlp_text(message: Message):
             return
 
     if not dati or not dati.get("is_valid", False) or float(dati.get("importo", 0.0)) <= 0:
-        await message.reply("❓ Non ho riconosciuto una spesa valida. Consulta la sezione ℹ️ Guida per esempi.", parse_mode=ParseMode.HTML)
+        await message.reply("❓ Non ho riconosciuto una transazione con importo valido. Esempio: <code>Marco mi ha offerto un gelato 3</code> oppure <code>Ho offerto gelato a Marco 3</code>", parse_mode=ParseMode.HTML)
         return
 
     tipo_mov = dati.get("tipo_movimento", "USCITA")
@@ -567,8 +574,92 @@ async def handle_nlp_text(message: Message):
     try:
         with conn.cursor() as cursor:
 
-            # 1. ANTICIPO COLLETTA DI GRUPPO
-            if tipo_mov == "ANTICIPO_COLLETTA" and partecipanti:
+            def get_friend_net_balance(cur, uid, p_name):
+                cur.execute("""
+                    SELECT SUM(CASE WHEN tipo = 'HO_OFFERTO' THEN importo ELSE -importo END)
+                    FROM debiti_crediti
+                    WHERE user_id = %s AND persona = %s
+                """, (uid, p_name))
+                res = cur.fetchone()[0]
+                return float(res) if res is not None else 0.0
+
+            # ---------------------------------------------------------
+            # 1. QUALCUNO OFFRE A ME (MI_HA_OFFERTO) -> Nessuna uscita dal conto!
+            # ---------------------------------------------------------
+            if tipo_mov == "MI_HA_OFFERTO":
+                nome_p = (persona or "Amici").capitalize()
+                
+                # Registra solo il debito/favore verso l'amico
+                cursor.execute("""
+                    INSERT INTO debiti_crediti (user_id, persona, tipo, importo, descrizione, data_ora)
+                    VALUES (%s, %s, 'MI_HA_OFFERTO', %s, %s, %s)
+                """, (user_id, nome_p, importo, descrizione, data_ora))
+                conn.commit()
+
+                saldo_att = get_friend_net_balance(cursor, user_id, nome_p)
+                if saldo_att > 0:
+                    saldo_str = f"🟢 <b>{html.escape(nome_p)} ti deve ancora €{saldo_att:.2f}</b>"
+                elif saldo_att < 0:
+                    saldo_str = f"🔴 <b>Devi dare/offrire a {html.escape(nome_p)} €{-saldo_att:.2f}</b>"
+                else:
+                    saldo_str = f"⚪ <b>Sei perfettamente in pari con {html.escape(nome_p)}!</b>"
+
+                await message.reply(
+                    f"🍦 <b>Offerta ricevuta annotata!</b>\n"
+                    f"👤 <b>Offerto da:</b> {html.escape(nome_p)}\n"
+                    f"☕ <b>Cosa:</b> {html.escape(descrizione)}\n"
+                    f"💰 <b>Valore:</b> €{importo:.2f} <i>(nessuna spesa dal tuo portafoglio)</i>\n\n"
+                    f"📊 <b>Saldo aggiornato con {html.escape(nome_p)}:</b>\n{saldo_str}",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+
+            # ---------------------------------------------------------
+            # 2. HO OFFERTO IO (HO_OFFERTO) -> Spesa tua + Credito verso l'amico
+            # ---------------------------------------------------------
+            elif tipo_mov == "HO_OFFERTO":
+                nome_p = (persona or "Amico").capitalize()
+
+                cursor.execute("""
+                    INSERT INTO transazioni (user_id, data_ora, tipo_movimento, tipo_inserimento, esercente, totale, metodo_pagamento, note)
+                    VALUES (%s, %s, 'USCITA', 'MANUALE', %s, %s, %s, %s)
+                    RETURNING id
+                """, (user_id, data_ora, esercente, importo, metodo, f"Offerto a {nome_p}: {descrizione}"))
+                t_id = cursor.fetchone()[0]
+
+                cursor.execute("""
+                    INSERT INTO voci_spesa (transazione_id, nome, quantita, prezzo_unitario, prezzo_totale, macro_categoria, sotto_categoria)
+                    VALUES (%s, %s, 1.0, %s, %s, %s, %s)
+                """, (t_id, f"{descrizione} (offerto a {nome_p})", importo, importo, macro_cat, sotto_cat))
+
+                cursor.execute("""
+                    INSERT INTO debiti_crediti (user_id, persona, tipo, importo, descrizione, data_ora)
+                    VALUES (%s, %s, 'HO_OFFERTO', %s, %s, %s)
+                """, (user_id, nome_p, importo, descrizione, data_ora))
+                conn.commit()
+
+                saldo_att = get_friend_net_balance(cursor, user_id, nome_p)
+                if saldo_att > 0:
+                    saldo_str = f"🟢 <b>{html.escape(nome_p)} ti deve in totale €{saldo_att:.2f}</b>"
+                elif saldo_att < 0:
+                    saldo_str = f"🔴 <b>Devi ancora dare a {html.escape(nome_p)} €{-saldo_att:.2f}</b>"
+                else:
+                    saldo_str = f"⚪ <b>Sei perfettamente in pari con {html.escape(nome_p)}!</b>"
+
+                await message.reply(
+                    f"🤝 <b>Offerta registrata!</b>\n"
+                    f"👤 <b>A chi:</b> {html.escape(nome_p)}\n"
+                    f"☕ <b>Cosa:</b> {html.escape(descrizione)}\n"
+                    f"💰 <b>Spesa tua:</b> -€{importo:.2f} ({metodo})\n\n"
+                    f"📊 <b>Saldo aggiornato:</b>\n{saldo_str}",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+
+            # ---------------------------------------------------------
+            # 3. ANTICIPO COLLETTA DI GRUPPO
+            # ---------------------------------------------------------
+            elif tipo_mov == "ANTICIPO_COLLETTA" and partecipanti:
                 quota_singola = round(importo / len(partecipanti), 2)
                 nome_regalo = descrizione or f"Regalo {destinatario or 'Amico'}"
 
@@ -607,7 +698,9 @@ async def handle_nlp_text(message: Message):
                 )
                 return
 
-            # 2. SALDO QUOTA RICEVUTA
+            # ---------------------------------------------------------
+            # 4. SALDO QUOTA RICEVUTA
+            # ---------------------------------------------------------
             elif tipo_mov == "SALDO_RICEVUTO":
                 nome_p = persona.capitalize() if persona else "Amico"
 
@@ -654,34 +747,9 @@ async def handle_nlp_text(message: Message):
                 )
                 return
 
-            # 3. OFFERTE AL BAR TRA AMICI
-            elif tipo_mov == "HO_OFFERTO":
-                nome_p = (persona or "Amico").capitalize()
-                cursor.execute("""
-                    INSERT INTO transazioni (user_id, data_ora, tipo_movimento, tipo_inserimento, esercente, totale, metodo_pagamento, note)
-                    VALUES (%s, %s, 'USCITA', 'MANUALE', %s, %s, %s, %s)
-                    RETURNING id
-                """, (user_id, data_ora, esercente, importo, metodo, f"Offerto a {nome_p}: {descrizione}"))
-                t_id = cursor.fetchone()[0]
-
-                cursor.execute("""
-                    INSERT INTO voci_spesa (transazione_id, nome, quantita, prezzo_unitario, prezzo_totale, macro_categoria, sotto_categoria)
-                    VALUES (%s, %s, 1.0, %s, %s, %s, %s)
-                """, (t_id, f"{descrizione} (offerto a {nome_p})", importo, importo, macro_cat, sotto_cat))
-
-                cursor.execute("""
-                    INSERT INTO debiti_crediti (user_id, persona, tipo, importo, descrizione, data_ora)
-                    VALUES (%s, %s, 'HO_OFFERTO', %s, %s, %s)
-                """, (user_id, nome_p, importo, descrizione, data_ora))
-                conn.commit()
-
-                await message.reply(
-                    f"🤝 <b>Offerta registrata!</b>\n👤 <b>A chi:</b> {html.escape(nome_p)}\n☕ <b>Cosa:</b> {html.escape(descrizione)}\n💰 <b>Importo:</b> €{importo:.2f} ({metodo})",
-                    parse_mode=ParseMode.HTML
-                )
-                return
-
-            # 4. SPESA O REGALO FATTO DA SOLO / ENTRATE STANDARD
+            # ---------------------------------------------------------
+            # 5. SPESA PERSONALE / REGALO FATTO DA SOLO / ENTRATA
+            # ---------------------------------------------------------
             cursor.execute("""
                 INSERT INTO transazioni (user_id, data_ora, tipo_movimento, tipo_inserimento, esercente, totale, metodo_pagamento, note)
                 VALUES (%s, %s, %s, 'MANUALE', %s, %s, %s, %s)
